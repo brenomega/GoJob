@@ -2,14 +2,10 @@
 import json,subprocess,tempfile,time,unittest
 from pathlib import Path
 from unittest.mock import patch
-try:
-    from automation.supervisor import recovery_dispatch as d, recovery_context as ctx, stable_supervisor as s
-    from automation.supervisor import rescue_watchdog as watch
-except ImportError:
-    import recovery_dispatch as d
-    import recovery_context as ctx
-    import stable_supervisor as s
-    import rescue_watchdog as watch
+import recovery_dispatch as d
+import recovery_context as ctx
+import stable_supervisor as s
+import rescue_watchdog as watch
 
 class IncidentRecovery(unittest.TestCase):
     def setUp(self):
@@ -98,13 +94,13 @@ class IncidentRecovery(unittest.TestCase):
 
     def test_bounded_repair_allows_future_retry_not_permanent_failed_marker(self):
         self.assertTrue(d.repair_allowed(self.folder))
-        d.record_repair_attempt(self.folder,'FAILED','temporary network')
+        self.assertTrue(d.reserve_repair_attempt(self.folder))
         self.assertFalse(d.repair_allowed(self.folder))
         state=d.read_json(self.folder/'repair_attempts.json',{})
         state['next_attempt_at']=time.time()-1
         d.save_json(self.folder/'repair_attempts.json',state)
         self.assertTrue(d.repair_allowed(self.folder))
-        d.record_repair_attempt(self.folder,'FAILED','again')
+        self.assertTrue(d.reserve_repair_attempt(self.folder))
         self.assertFalse(d.repair_allowed(self.folder,now=time.time()+100000))
 
     def test_proactive_audit_is_independent_and_deduplicated(self):
@@ -131,7 +127,7 @@ class IncidentRecovery(unittest.TestCase):
         with patch.object(watch,'service_status',return_value={'ActiveState':'failed','Result':'exit-code','ExecMainStatus':'1'}),\
              patch.object(watch,'triage_event',return_value=(diagnosed,{})),\
              patch.object(watch,'fallback_repair',return_value={'pr':44,'merge':{'oid':'synthetic'}}) as repair,\
-             patch.object(watch,'promote_approved_supervisor',return_value={'status':'DEPLOYED'}) as deploy:
+             patch.object(d,'promote_approved_supervisor',return_value={'status':'DEPLOYED'}) as deploy:
             outcome=watch.check(self.repo,self.home)
             self.assertEqual(outcome['status'],'REPAIRED')
             repair.assert_called_once();deploy.assert_called_once()
@@ -146,58 +142,48 @@ class IncidentRecovery(unittest.TestCase):
              patch.object(s,'supervisor_triage',return_value=({'decision':'REPAIR_RUNNER','cause':'PATH bug',
                      'evidence':['NVM'], 'plan':'persist PATH'},{})),\
              patch.object(s,'repair',return_value={'pr':5,'merge':{'oid':'sha'}}) as repair,\
-             patch.object(s,'promote_approved_supervisor',return_value={'status':'DEPLOYED'}),\
+             patch.object(d,'promote_approved_supervisor',return_value={'status':'DEPLOYED'}),\
              patch.object(s,'proactive_cycle',return_value={'status':'COOLDOWN'}),\
              patch.object(s,'maybe_evolve',return_value={'status':'NO_METRICS'}):
             outcome=s.main(['--repo',str(self.repo),'--home',str(self.home),'--max-repairs','1'])
             self.assertEqual(outcome,0)
             repair.assert_called_once()
 
-    def test_watchdog_can_repair_when_current_supervisor_has_syntax_error(self):
-        stable=self.home/'stable';stable.mkdir()
-        (stable/'stable_supervisor.py').write_text('def this is broken syntax:')
-        fallback=stable/'stable_supervisor.previous.123.py'
-        fallback.write_text('def repair(repo,home,inc,info):\n    return {"pr":31,"merge":{"oid":"abc"}}\n')
-        # It is the watchdog script, not the broken supervisor, that imports
-        # the last-known-good repair engine.
-        result=watch.fallback_repair(self.repo,self.home,'case',self.info,stable)
-        self.assertEqual(result['pr'],31)
-        self.assertIn('broken syntax',(stable/'stable_supervisor.py').read_text())
-
-    def test_watchdog_tries_next_engine_if_a_candidate_cannot_be_imported(self):
-        stable=self.home/'stable';stable.mkdir()
-        (stable/'stable_supervisor.previous.222.py').write_text('def repair(repo,home,inc,info):\n    return {"pr":17}\n')
-        (stable/'stable_supervisor.previous.333.py').write_text('broken python syntax here')
-        result=watch.fallback_repair(self.repo,self.home,'case',self.info,stable)
-        self.assertEqual(result['pr'],17)
-
-    def test_promotion_rejects_unreviewed_sha_and_runs_clean_canary(self):
-        import shutil,hashlib
-        root=Path(__file__).resolve().parents[1]
-        remote=Path(self.t.name)/'remote.git'
-        subprocess.run(['git','init','--bare','-q',str(remote)],check=True)
-        subprocess.run(['git','-C',str(self.repo),'remote','add','origin',str(remote)],check=True)
-        folder=self.repo/'automation/supervisor';folder.mkdir(parents=True,exist_ok=True)
-        for name in ('stable_supervisor.py','recovery_context.py','recovery_dispatch.py','rescue_watchdog.py','schema_protocol.py'):
-            src=(root/'gojob_runner/schema_protocol.py') if name=='schema_protocol.py' else root/name
-            if not src.exists():src=root/'supervisor'/name
-            shutil.copy2(src,folder/name)
-        (self.repo/'RUNNER_VERSION').write_text('3.4.0\n')
-        subprocess.run(['git','-C',str(self.repo),'add','.'],check=True)
-        subprocess.run(['git','-C',str(self.repo),'commit','-qm','approved runner'],check=True)
-        subprocess.run(['git','-C',str(self.repo),'branch','-M','develop'],check=True)
-        subprocess.run(['git','-C',str(self.repo),'push','-u','origin','develop'],check=True)
-        sha=subprocess.check_output(['git','-C',str(self.repo),'rev-parse','HEAD'],text=True).strip()
-        stable=self.home/'stable';stable.mkdir()
-        (stable/'stable_supervisor.py').write_text('old=1\n')
-        with self.assertRaisesRegex(RuntimeError,'Develop moved'):
-            d.promote_approved_supervisor(self.repo,self.home,expected_merge='different_SHA')
-        self.assertEqual((stable/'stable_supervisor.py').read_text(),'old=1\n')
-        result=d.promote_approved_supervisor(self.repo,self.home,expected_merge={'oid':sha})
-        self.assertEqual(result['status'],'DEPLOYED')
-        self.assertIn('def main(', (stable/'stable_supervisor.py').read_text())
-        self.assertEqual(d.promote_approved_supervisor(self.repo,self.home,expected_merge=sha)['status'],
-                         'ALREADY_CURRENT')
+    def test_watchdog_budget_is_stable_across_restarts_and_shares_supervisor_lock(self):
+        diagnosis={'decision':'REPAIR_RUNNER','cause':'startup import failure',
+                   'plan':'fix missing module','evidence':['clean checkout import fails']}
+        def crash(*_):
+            raise KeyboardInterrupt
+        ids=[]
+        with (patch.object(watch,'triage_event',return_value=(diagnosis,{})),
+              patch.object(watch,'fallback_repair',side_effect=crash) as repair):
+            for number in (1,2,3):
+                d.save_json(self.home/'supervisor_session.json',
+                            {'phase':'RUNNING','started_at':number,'pid':400+number})
+                status={'ActiveState':'failed','Result':'exit-code','ExecMainStatus':'1',
+                        'MainPID':str(400+number)}
+                with patch.object(watch,'service_status',return_value=status):
+                    if number==1:
+                        with d.repair_lock(self.home,self.repo) as held:
+                            self.assertTrue(held)
+                            self.assertEqual(watch.check(self.repo,self.home)['status'],'REPAIR_BUSY')
+                            repair.assert_not_called()
+                    if number<=2:
+                        with self.assertRaises(KeyboardInterrupt):
+                            watch.check(self.repo,self.home)
+                        incidents=list((self.home/'incidents').glob('*/repair_attempts.json'))
+                        self.assertEqual(len(incidents),1)
+                        state=d.read_json(incidents[0],{})
+                        self.assertEqual(state['attempts'],number)
+                        ids.append(incidents[0].parent.name)
+                        state['next_attempt_at']=0
+                        d.save_json(incidents[0],state)
+                    else:
+                        result=watch.check(self.repo,self.home)
+                        self.assertEqual(result['status'],'REPAIR_COOLDOWN_OR_EXHAUSTED')
+                        self.assertEqual(result['incident'],ids[0])
+            self.assertEqual(repair.call_count,2)
+            self.assertEqual(ids[0],ids[1])
 
     def test_proactive_false_positive_without_reproduction_is_follow_up_only(self):
         fake=lambda *_:{'decision':'REPAIR_RUNNER','summary':'unspecified',

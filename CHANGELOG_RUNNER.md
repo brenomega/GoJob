@@ -20,3 +20,10 @@
 - Código gerado ainda requer gates e revisão. Falhas do instalador *antes da instalação do worker* continuam um risco de bootstrap, agora mitigado por validação local anterior.
 
 Versões anteriores (3.1.1–3.4.2) continuam preservadas no histórico e nos PRs existentes. Este pacote usa nova branch de atualização e não modifica diretamente o código do produto.
+
+### Correções após a primeira revisão do PR #13
+
+- O instalador gera um pacote completo com manifesto por SHA. O host pode preparar o worker com `python -I -B automation/supervisor/quickstart.py --repo <checkout> --source-sha <SHA-do-candidato> --enable`. A instalação do supervisor e do watchdog usa o SHA do merge confirmado. A troca preserva a geração anterior por inteiro.
+- A retomada reutiliza pareceres do mesmo PR, HEAD e BASE. O controlador registra intenção e confirmação antes de fechar a Issue e exige o job `verify` de `gojob-verify` para o par revisado. O merge depende de proteção estrita de `develop` com o check do GitHub Actions, inclusive para administradores.
+- Vetos persistem em `NEEDS_USER`. Supervisor e watchdog compartilham a exclusão e a reserva prévia de tentativas. O broker confere o índice contra o plano e os agentes recebem um ambiente permitido e contexto redigido.
+- O controlador no BigLinux deve verificar os timers ativos e os serviços do supervisor e do watchdog antes de gravar `INSTALLED`. Os testes locais simulam systemd e verificam a promoção e o retorno à geração anterior.
