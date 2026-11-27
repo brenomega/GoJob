@@ -1,5 +1,20 @@
 # GoJob Runner — CHANGELOG
 
+## 3.2.0 — 2026-11-26
+- Correção procedural da fila: persistência `BLOCKED` agora é encaminhada a um agente diagnosticador independente e, se seguro, a outro especialista de reparo; não ignora indefinidamente EAPs bloqueadas.
+- Preserva impedimentos legítimos (`STOP`, `BLOCK`, revogação de política, falta de credencial/evidência, recusa de integrador) em `NEEDS_USER`; limite de duas tentativas, nunca falsificar DONE.
+- PR original continua sob a mesma EAP; qualquer HEAD novo invalida revisão e CI antigos, exigindo gates/revisores novamente.
+- Supervisor registra incidente próprio para bloqueios de política e dependências externas sem classificá-los como crash corrigível do runner.
+- Instalador agora atualiza realmente o **código do runner em origin/develop** (a instalação anterior só atualizava supervisor local), mediante worktree isolada, Issue, PR, revisão estratégica+técnica por agentes Codex independentes, CI do HEAD e merge commit.
+- Compatibilidade de atualização da base 3.1.1 ou 3.1.2; não copia testes exclusivos da distribuição para o repositório de produto, não altera arquivos da aplicação.
+- Saída do quickstart reduzida a resumos dos testes, sem confundir incidentes sintéticos com operação real.
+
+## 3.1.2 — 2026-11-26
+- Corrigida a instalação do serviço `systemd --user`: um drop-in gerenciado (`90-gojob-runtime.conf`) preserva o `PATH` validado da sessão, incluindo NVM/Node e o executável Codex; vence overrides anteriores sem apagá-los.
+- Instalação idempotente não reinicia supervisor `active`/`activating`, preservando chamadas Codex e worktrees em andamento.
+- Regressões do runner validam NVM ausente no PATH básico do systemd, precedência do drop-in, instalação fail-closed e não interrupção durante atualização.
+- Mudança restrita ao instalador/operacional do runner; sem código ou testes de produto.
+
 ## 3.1.1 — 2026-11-26
 - Corrige UX de instalação e inicialização: `quickstart.py` reúne preflight, autenticação quando necessário, teste do runner, clone, bootstrap inicial idempotente e ativação do supervisor.
 - O primeiro ciclo é disparado por systemd imediatamente, sem exigir `--task-id`, e a fila prossegue automaticamente nos próximos ciclos.

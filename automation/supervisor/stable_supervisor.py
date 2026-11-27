@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable, standalone GoJob RUNNER supervisor v3.0.0 (stdlib only).
+"""Stable, standalone GoJob RUNNER supervisor v3.2.0 (stdlib only).
 
 Install OUTSIDE product checkout. It can restart the runner from a pinned remote
 commit; on a reproducible RUNNER crash it attempts a reviewed repair PR.
@@ -294,8 +294,12 @@ def main(argv=None):
                     return 0
                 error=redact(result.stderr or result.stdout)
                 if result.returncode in (2,76):
-                    print('Bloqueio de política/ambiente; não é defeito a corrigir: '+error[-350:],file=sys.stderr)
-                    notify('GoJob runner bloqueado: '+error)
+                    kind='task_requires_intervention' if result.returncode==2 else 'external_dependency'
+                    location,info=incident(home,args.repo,error,kind)
+                    print('[GOJOB_ATTENTION] '+kind+'; incidente '+info['id']+': '+error[-350:],file=sys.stderr)
+                    notify('GoJob runner: '+kind+'; incidente '+info['id']+'; '+error[-350:])
+                    # A task policy stop is not a RUNNER crash. Never route it to
+                    # a source-code repairer, falsely mark DONE or reset state.
                     return result.returncode
                 if result.returncode==75 and cycle<2:
                     time.sleep(5*(cycle+1));continue
