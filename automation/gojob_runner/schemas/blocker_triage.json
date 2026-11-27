@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "decision": {"type": "string", "enum": ["REPAIR", "NEEDS_USER", "POLICY_STOP"]},
+    "cause": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "plan": {"type": "string"},
+    "missing_prerequisites": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["decision", "cause", "evidence", "plan", "missing_prerequisites"],
+  "additionalProperties": false
+}
