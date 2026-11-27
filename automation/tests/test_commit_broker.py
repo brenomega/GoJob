@@ -46,4 +46,25 @@ class CommitBroker(unittest.TestCase):
         (self.repo/'code.py').write_text('x=1\n')
         with self.assertRaises(PolicyFailure):apply_commit_plan(self.repo,'1.2.1',{'status':'DONE'})
 
+
+    def test_repair_broker_preserves_foreign_index_head_and_dirty_files(self):
+        from stable_supervisor import apply_repair_commit_plan
+
+        path='automation/supervisor/change.py'
+        edit=self.repo/path
+        edit.parent.mkdir(parents=True)
+        edit.write_text('runner = 1\n')
+        (self.repo/'README.md').write_text('Local staged change\n')
+        git(self.repo,'add','README.md')
+        git(self.repo,'update-index','--refresh')
+        def snapshot():
+            return (git(self.repo,'rev-parse','HEAD'),git(self.repo,'diff','--cached','--binary'),
+                    (self.repo/'.git/index').read_bytes(),edit.read_bytes(),(self.repo/'README.md').read_bytes())
+        before=snapshot()
+        report={'status':'DONE','commit_plan':[
+            {'message':'fix(runner): corrija recuperação do supervisor [#0.9.0]','paths':[path]}]}
+        with self.assertRaisesRegex(PolicyFailure,'staged'):
+            apply_repair_commit_plan(self.repo,report)
+        self.assertEqual(snapshot(),before)
+
 if __name__=='__main__':unittest.main()
