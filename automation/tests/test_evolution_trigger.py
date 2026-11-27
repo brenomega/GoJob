@@ -18,9 +18,11 @@ class EvolutionTrigger(unittest.TestCase):
             result=SimpleNamespace(returncode=0,stdout='task DONE',stderr='')
             with patch.object(s,'resume_runner',return_value=(result,'sha')),\
                  patch.object(s,'maybe_evolve',side_effect=RuntimeError('Codex quota')),\
-                 patch.object(s,'incident',return_value=(Path(tmp),{'error':'quota'})),\
+                 patch.object(s,'process_incident',return_value={'status':'ENVIRONMENT'}) as incident,\
+                 patch.object(s,'proactive_cycle',return_value={'status':'COOLDOWN'}),\
                  patch.object(s,'repair') as repair:
                 self.assertEqual(s.main(['--repo',str(repo),'--home',str(Path(tmp)/'home')]),0)
                 repair.assert_not_called()
+                incident.assert_called_once()
 
 if __name__=='__main__':unittest.main()
