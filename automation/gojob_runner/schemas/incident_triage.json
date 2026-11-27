@@ -1,0 +1,13 @@
+{
+  "type":"object",
+  "additionalProperties":false,
+  "properties":{
+    "decision":{"type":"string","enum":["REPAIR_RUNNER","RETRY_TRANSIENT","TASK_RECOVERY","NEEDS_USER","ENVIRONMENT","POLICY_STOP","NO_ACTION"]},
+    "cause":{"type":"string"},
+    "evidence":{"type":"array","items":{"type":"string"}},
+    "plan":{"type":"string"},
+    "confidence":{"type":"string","enum":["high","medium","low"]},
+    "risk_if_wrong":{"type":"string"}
+  },
+  "required":["decision","cause","evidence","plan","confidence","risk_if_wrong"]
+}

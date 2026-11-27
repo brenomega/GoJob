@@ -8,6 +8,7 @@ import argparse, fcntl, hashlib, json, os, re, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from . import VERSION, MODEL, EFFORT
+from .review_policy import disposition, review_feedback, MAX_REVIEW_ROUNDS
 from .codex import Codex
 from .context import context, render
 from .state import Journal, load, save_atomic
@@ -87,6 +88,9 @@ class Runner:
                 'RUNNER_VERSION', 'CHANGELOG_RUNNER.md',
                 'docs/PRODUCT_NORTH_STAR.md', 'docs/SECURITY_POLICY.md',
                 'docs/TESTING_POLICY.md', 'docs/DECISION_LEDGER.md',
+                'docs/BACKLOG.json', 'docs/ROADMAP.md',
+                'docs/ENGINEERING_POLICY.md', 'docs/USER_EXPERIENCE.md',
+                'docs/STRATEGIC_REVIEW.md',
             )
             if any(x.startswith(protected) for x in changed):
                 raise PolicyFailure('Task de produto tentou modificar runner/governança/CI. Abrir proposta separada para revisão de política')
@@ -147,13 +151,14 @@ class Runner:
     def _validate_review(self,report,head,base,decision_key):
         if report.get('head_sha')!=head or report.get('base_sha')!=base:
             raise PolicyFailure('Parecer não corresponde ao SHA atual')
-        if not isinstance(report.get('findings'),list) or not report.get('rationale'):
-            raise PolicyFailure('Parecer sem fundamentação')
         if decision_key=='strategic' and not all(report.get(k) for k in ('opportunity_cost','alternative','north_star_impact')):
             raise PolicyFailure('Revisão estratégica superficial')
         if decision_key=='technical' and (not isinstance(report.get('real_evidence'),list)
             or not report.get('real_evidence') or not report.get('tests_assessed')):
             raise PolicyFailure('Revisão técnica sem avaliação de testes e evidências reais')
+        if (not isinstance(report.get('findings'),list) or not isinstance(report.get('rationale'),str)
+            or len(report['rationale'].strip())<12):
+            raise PolicyFailure('Parecer sem fundamentação verificável')
     def synchronize_base(self,task):
         """Append a safe merge from latest develop: no rebase, reset or force-push.
 
@@ -205,10 +210,136 @@ class Runner:
             raise PolicyFailure('Merge da base não confirmado; não publicar HEAD antigo')
         self._delegate_product_tests(task,work,latest)
         audit,verification=self._verify(task,work,latest)
+        new_head=audit['head']
         git(work,'push','origin',branch,timeout=240)
         self.record(tid,'BASE_SYNCED',stage='PR',base=latest,head=new_head,
                     review_head=None,ci_head=None,strategic=None,technical=None,local_gates=verification)
         return {'old_head':old_head,'new_head':new_head,'new_base':latest}
+
+    def _blocked_resolution(self,task):
+        """One bounded independent diagnosis and repair of a previously BLOCKED task.
+
+        This never certifies acceptance, changes governance, or bypasses reviews.
+        Only DEV BLOCKED and repair-after-REVISE have safe automatic paths.
+        All other policy refusals remain terminal and visible.
+        """
+        tid=task['id'];saved=self.entry(tid)
+        if saved.get('stage')!='BLOCKED':
+            raise PolicyFailure('Recovery requires persisted BLOCKED task')
+        attempts=int(saved.get('blocker_recovery_attempts') or 0)
+        if attempts>=2:
+            self.record(tid,'BLOCKER_EXHAUSTED',stage='NEEDS_USER',
+                        blocked_reason=saved.get('reason','Sem progresso após duas tentativas'))
+            return {'task':tid,'state':'NEEDS_USER','reason':'Limite de recuperação atingido'}
+        branch=saved.get('branch') or self.branch(task)
+        work=self.worktree(task,branch)
+        staged,dirty=worktree_changes(work)
+        if staged:
+            self.record(tid,'BLOCKER_STAGED',stage='NEEDS_USER',
+                        blocked_reason='Índice Git staged exige reconciliação; não descartar trabalho')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Índice staged desconhecido'}
+        if not saved.get('pr') and not (isinstance(saved.get('report'),dict)
+                                          and saved['report'].get('status')=='BLOCKED'
+                                          and 'Developer relatou bloqueio' in saved.get('reason','')):
+            self.record(tid,'BLOCKER_POLICY_EXCLUDED',stage='NEEDS_USER',
+                        blocked_reason='Falha de política/estado sem bloqueio explícito do Developer')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Bloqueio não delegável ao especialista'}
+        # Inspect the original review decisions and exact HEAD independently.
+        current_head=git(work,'rev-parse','HEAD')
+        strategic=saved.get('strategic') or {}
+        technical=saved.get('technical') or {}
+        has_pr=bool(saved.get('pr'))
+        if has_pr and (strategic.get('decision') in ('STOP','REVISE') or technical.get('decision') in ('BLOCK','REVISE')):
+            verdict=disposition(strategic,technical)
+            if verdict.action=='NEEDS_USER':
+                self.record(tid,'BLOCKER_HUMAN_GATE',stage='NEEDS_USER',blocked_reason=verdict.reason)
+                return {'task':tid,'state':'NEEDS_USER','reason':verdict.reason}
+            if int(saved.get('review_rounds_total') or 0)>=MAX_REVIEW_ROUNDS:
+                self.record(tid,'BLOCKER_REVIEW_BUDGET',stage='NEEDS_USER',
+                            blocked_reason='Limite de três rodadas de revisão esgotado')
+                return {'task':tid,'state':'NEEDS_USER','reason':'Review budget exhausted'}
+        if has_pr and (strategic.get('decision') not in ('REVISE','PASS','STOP')
+                       or technical.get('decision') not in ('REVISE','ACCEPT','BLOCK')):
+            self.record(tid,'BLOCKER_UNKNOWN_PR',stage='NEEDS_USER',
+                        blocked_reason='PR bloqueado sem parecer verificável para HEAD exato')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Parecer PR insuficiente'}
+        if has_pr and not any(x in (strategic.get('decision'),technical.get('decision')) for x in ('REVISE','STOP','BLOCK')):
+            self.record(tid,'BLOCKER_NON_REVIEW',stage='NEEDS_USER',
+                        blocked_reason='PR sem REVISE: não converter recusa de integrador/CI em edição de código')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Sem reparo de revisão autorizado'}
+        if has_pr and saved.get('review_head')!=current_head:
+            self.record(tid,'BLOCKER_STALE_REVIEW',stage='NEEDS_USER',
+                        blocked_reason='HEAD mudou após revisão; não aplicar achados obsoletos')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Revisão de outro HEAD'}
+        # First, an independent read-only specialist must decide whether remediation
+        # can actually satisfy the original acceptance criteria with available proof.
+        base=saved.get('base') or git(work,'merge-base','HEAD','origin/develop')
+        summary={k:saved.get(k) for k in ('reason','report','findings','strategic','technical',
+                                          'review_head','review_history','review_rounds_total','pr','updated_at')}
+        prompt=self._prompt('INDEPENDENT BLOCKER DIAGNOSTICIAN',task,work,base,
+            'Não confunda problema real de acesso, autenticação, falta de dados ou política com bug do runner. '
+            'Diga se um NOVO agente pode produzir mudança legítima, usando somente evidências acessíveis; '
+            'NEEDS_USER quando faltar acesso autorizado, prova externa ou requisito impossível; '
+            'POLICY_STOP se tentar reduzir o escopo, mudar aceitação ou contrariar um reviewer. '
+            'Não invente resultados de inspeção local ou testes. Não edite arquivos. '
+            f'REGISTRO DO BLOQUEIO: {json.dumps(summary,ensure_ascii=False,default=str)[:9500]} '
+            f'HEAD ATUAL: {current_head}; worktree dirty={bool(dirty)}. '
+            'Se houver REVISE, priorize corrigir os achados existentes, sem alterar as regras da Issue.')
+        diagnosis=self._agent('blocker-diagnostician',prompt,work,'blocker_triage.json',write=False)
+        decision=diagnosis.get('decision')
+        if (not isinstance(diagnosis.get('evidence'),list)
+            or not diagnosis.get('cause') or not diagnosis.get('plan')):
+            raise PolicyFailure('Diagnóstico sem evidências, causa e plano verificáveis')
+        if decision not in ('REPAIR','NEEDS_USER','POLICY_STOP'):
+            raise PolicyFailure('Diagnóstico de bloqueio inválido: sem decisão autorizada')
+        self.record(tid,'BLOCKER_DIAGNOSED',blocker_diagnosis=diagnosis,
+                    blocker_recovery_attempts=attempts+1)
+        if decision!='REPAIR':
+            self.record(tid,'BLOCKER_NEEDS_USER',stage='NEEDS_USER',
+                        blocked_reason=diagnosis.get('cause','Bloqueio não reparável de forma segura'))
+            return {'task':tid,'state':'NEEDS_USER','reason':decision}
+        # A *new* Codex session, not the original Developer or Reviewer, attempts
+        # a scoped modification; the trusted controller performs Git writes.
+        prompt=self._prompt('INDEPENDENT BLOCKER REPAIR SPECIALIST',task,work,base,
+            'Você é outro agente e NÃO pode aprovar o próprio trabalho. '
+            'Corrija o problema causal e preserve todas as restrições/reviews existentes. '
+            'Não altere testes do produto: o Test Engineer será convocado pelo controlador. '
+            'Nunca executar Git write, nem reduzir critérios de aceitação, forjar medições ou acessar segredos. '
+            f'DIAGNÓSTICO: {json.dumps(diagnosis,ensure_ascii=False)[:5500]} '
+            f'BLOQUEIO: {json.dumps(summary,ensure_ascii=False,default=str)[:7500]} '
+            f'HEAD ATUAL {current_head}, worktree dirty={bool(dirty)}. '
+            f'Forneça commit_plan exato com [#{tid}], sem force-push/amend. '
+            'Se não puder produzir mudança legítima, responda BLOCKED e explique o requisito faltante.')
+        # Persist intent *before* invoking an agent that may edit the worktree.
+        self.record(tid,'BLOCKER_REPAIR_START',stage='BLOCKER_REPAIRING',
+                    blocker_source_head=current_head)
+        try:
+            report=self._agent('blocker-repair-specialist',prompt,work,'developer.json',write=True)
+        except (ExternalFailure,TransientFailure):
+            # If edits happened before CLI transport failed, preserve them and let
+            # the following cycle inspect the tree instead of discarding edits.
+            self.record(tid,'BLOCKER_AGENT_INTERRUPTED',stage='BLOCKED',
+                        blocker_interrupted=True)
+            raise
+        self.record(tid,'BLOCKER_REPAIR_REPORT',blocker_repair_report=report)
+        if report.get('status')!='DONE':
+            self.record(tid,'BLOCKER_REPAIR_NOT_DONE',stage='NEEDS_USER',
+                        blocked_reason=str(report.get('summary','Agente não solucionou'))[:400])
+            return {'task':tid,'state':'NEEDS_USER','reason':'Especialista não resolveu'}
+        changed=worktree_changes(work)[1]
+        if not changed:
+            self.record(tid,'BLOCKER_NO_CHANGE',stage='NEEDS_USER',
+                        blocked_reason='Especialista declarou DONE sem alterar arquivos')
+            return {'task':tid,'state':'NEEDS_USER','reason':'Nenhuma correção verificável'}
+        apply_commit_plan(work,tid,report)
+        actual=git(work,'rev-parse','HEAD')
+        if actual==current_head:
+            raise PolicyFailure('Correção não avançou o HEAD; sem progresso verificável')
+        # Existing PR stays open; no extra PR is created. Next normal execution
+        # redoes Test Engineer, local gates, review and CI for the new head.
+        self.record(tid,'BLOCKER_REPAIRED',stage='RECOVERED',head=actual,
+                    blocker_previous_head=current_head,review_head=None,ci_head=None)
+        return {'task':tid,'state':'RECOVERED','head':actual}
 
     def run_one(self,task,max_repairs=2):
         """Bounded automatic base reconciliation for independent parallel PRs."""
@@ -269,6 +400,7 @@ class Runner:
                 f"Cada commit: tipo(escopo): imperativo em português [#{tid}]. "
                 'Máximo oito commits, ideal 2–4, até 600 linhas alteradas por commit. '
                 'Proibido criar PR/Issue, force-push, remover testes falhando ou reescrever contratos para passar CI.')
+            self.record(tid,'DEVELOPER_START',stage='DEVELOPING',role='developer')
             dev=self._agent('developer',prompt,work,'developer.json',write=True)
             if dev.get('status')!='DONE':
                 self.record(tid,'DEVELOPER_BLOCKED',stage='BLOCKED',report=dev)
@@ -287,46 +419,84 @@ class Runner:
         pr=self.entry(tid).get('pr') or self.scm.ensure_pr(task,branch,issue)
         self.scm.snapshot(pr,branch,head,base)
         self.record(tid,'PR_CONFIRMED',stage='PR',pr=pr,head=head)
-        last_findings=None
-        for attempt in range(max_repairs+1):
+        # The per-PR budget is durable: neither restart nor specialist recovery
+        # may silently reset the number of review rounds. Three *full* rounds
+        # include at most two developer correction cycles.
+        previous=self.entry(tid)
+        reviewed=int(previous.get('review_rounds_total') or 0)
+        if reviewed >= MAX_REVIEW_ROUNDS:
+            self.record(tid,'REVIEW_BUDGET_EXHAUSTED',stage='NEEDS_USER',
+                        blocked_reason='Três rodadas completas de review sem convergência')
+            raise PolicyFailure('Três rodadas de review esgotadas; relatório preservado')
+        for attempt in range(reviewed, MAX_REVIEW_ROUNDS):
             self.scm.snapshot(pr,branch,head,base)
-            # Strategic reviewer never receives developer's rationale: context solely anchored to base+real diff.
+            self.record(tid,'STRATEGIC_REVIEW_START',stage='REVIEWING_STRATEGIC',review_head=head,review_attempt=attempt)
             strategy=self._agent('strategic-reviewer',self._prompt('STRATEGIC REVIEWER',task,work,base,
                 f'PR #{pr} HEAD {head}. Primeiro avalie direção, oportunidade marginal, trade-offs, métricas e alternativas. '
-                'Um código correto para uma meta errada deve ser reprovado. Examine diff e arquivos reais; não altere arquivos.'),
+                'Um código correto para uma meta errada deve ser reprovado. Examine diff e arquivos reais; não altere arquivos. '
+                'STOP não significa interromper o workflow: indique achados corrigíveis; para decisão humana '
+                'inadiável, especifique blocking_kind e a obrigação exata.'),
                 work,'strategic.json',write=False)
+            self.record(tid,'TECHNICAL_REVIEW_START',stage='REVIEWING_TECHNICAL',review_head=head,review_attempt=attempt)
             technical=self._agent('technical-reviewer',self._prompt('TECHNICAL REVIEWER',task,work,base,
                 f'PR #{pr} HEAD {head}. Inspecione implementação, casos negativos, concorrência, segurança, oráculos, '
                 'testes existentes em todos níveis, integração real e possíveis testes de mutação. '
-                'Não confunda mocks com evidência real; não altere arquivos.'),work,'technical.json',write=False)
+                'REVISE/BLOCK exige achados concretos, prioridades e provas. Não altere arquivos.'),
+                work,'technical.json',write=False)
             self._validate_review(strategy,head,base,'strategic')
             self._validate_review(technical,head,base,'technical')
             self.scm.snapshot(pr,branch,head,base)
             self.scm.comment(pr,head,base,'STRATEGIC_REVIEW',strategy)
             self.scm.comment(pr,head,base,'TECHNICAL_REVIEW',technical)
+            previous=self.entry(tid)
+            history=list(previous.get('review_history') or [])
+            history.append({'round':attempt+1,'base':base,'head':head,
+                            'strategic':strategy,'technical':technical})
+            verdict=disposition(strategy,technical)
             self.record(tid,'REVIEW',stage='REVIEW',review_head=head,
-                        strategic=strategy,technical=technical,review_attempt=attempt)
-            if strategy['decision']=='PASS' and technical['decision']=='ACCEPT':break
-            findings={'strategic':strategy.get('findings',[]),'technical':technical.get('findings',[])}
-            if (strategy['decision']=='STOP' or technical['decision']=='BLOCK' or
-                attempt>=max_repairs or findings==last_findings):
-                self.record(tid,'REVIEW_BLOCK',stage='BLOCKED',findings=findings)
-                raise PolicyFailure('Revisão bloqueou ou estagnou: escalar para agente de causa-raiz')
-            last_findings=findings
+                        strategic=strategy,technical=technical,review_attempt=attempt,
+                        review_rounds_total=attempt+1,review_history=history,
+                        review_disposition=verdict.action)
+            if verdict.action=='ACCEPT':
+                break
+            if verdict.action=='NEEDS_USER':
+                self.record(tid,'REVIEW_HUMAN_GATE',stage='NEEDS_USER',blocked_reason=verdict.reason)
+                raise PolicyFailure('Revisão exige autorização ou diagnóstico: '+verdict.reason)
+            if attempt+1>=MAX_REVIEW_ROUNDS:
+                self.scm.comment(pr,head,base,'REVIEW_ESCALATION',
+                                 {'decision':'BLOCK','findings':strategy.get('findings',[])+technical.get('findings',[])})
+                self.record(tid,'REVIEW_EXHAUSTED',stage='NEEDS_USER',
+                            blocked_reason='Três revisões completas sem aprovação; examinar histórico',
+                            final_feedback=review_feedback(strategy,technical))
+                raise PolicyFailure('Três rodadas de revisão sem aprovação; consultar histórico da tarefa')
             prompt=self._prompt('DEVELOPER REPAIR',task,work,base,
-                'Repare SOMENTE os achados causais na implementação; testes de regressão cabem ao Test Engineer independente. '
-                'Não altere contratos/arquivos do runner; não apague testes. '
-                f'HEAD {head}; findings {json.dumps(findings,ensure_ascii=False)}. '
+                'A revisão anterior NÃO foi aprovada. Corrija a implementação em vez de repetir o parecer. '
+                'Use TODA a fundamentação técnica e estratégica a seguir, mantenha a North Star e preserve testes. '
+                'Não altere contratos/arquivos do runner; regressões de produto cabem ao Test Engineer independente. '
+                'Se o revisor estiver exigindo objetivo conflitante com decisão confirmada, documente o conflito, '
+                'não altere a North Star para forçar aprovação. '
+                f'Rodada {attempt+1}/{MAX_REVIEW_ROUNDS}; HEAD {head}; '
+                f'PARECERES: {json.dumps(review_feedback(strategy,technical),ensure_ascii=False)}. '
                 f'Plano de commits novos com [#{tid}], nunca amend/force push.')
+            self.record(tid,'REPAIR_START',stage='REPAIRING',repair_source_head=head)
             report=self._agent('developer-repair',prompt,work,'developer.json',write=True)
-            if report.get('status')!='DONE':raise PolicyFailure('Reparo não concluído')
-            if worktree_changes(work)[1]:apply_commit_plan(work,tid,report)
+            if report.get('status')!='DONE':
+                self.record(tid,'REPAIR_NOT_DONE',stage='BLOCKED',report=report,
+                            reason='Implementador não concluiu correção; acionar especialista independente')
+                raise PolicyFailure('Reparo não concluído; especialista investigará o bloqueio no ciclo seguinte')
+            if not worktree_changes(work)[1]:
+                self.record(tid,'REPAIR_NO_DIFF',stage='BLOCKED',report=report,
+                            reason='Implementador não produziu diferença verificável')
+                raise PolicyFailure('Reparo sem modificações: escalar diagnóstico sem novo review idêntico')
+            apply_commit_plan(work,tid,report)
             self._delegate_product_tests(task,work,base)
             audit,verified=self._verify(task,work,base)
-            if audit['head']==head:raise PolicyFailure('Reparo não avançou HEAD')
+            if audit['head']==head:
+                raise PolicyFailure('Reparo não avançou HEAD')
             head=audit['head']
             git(work,'push','origin',branch,timeout=240)
-            self.record(tid,'REPAIR_PUSH',stage='PR',head=head,local_gates=verified)
+            self.record(tid,'REPAIR_PUSH',stage='PR',head=head,local_gates=verified,
+                        review_head=None,ci_head=None)
         self.scm.snapshot(pr,branch,head,base)
         ci_proof=self.scm.checks(pr,head,base,branch)
         self.record(tid,'CI_PASS',stage='CI',ci_head=head,ci_proof=ci_proof)
@@ -428,24 +598,60 @@ def main(argv=None):
         except BlockingIOError:
             print('[RUNNER_BUSY] another controller is active',file=sys.stderr);return 75
         code=0
-        for cycle in range(len(tasks)+1):
-            eligible=[t for t in tasks if r.entry(t['id']).get('stage') not in ('DONE','BLOCKED')
+        # Avoid one forever-BLOCKED task starving unrelated tasks. One bounded
+        # specialist recovery per persisted blocker, never an endless retry.
+        for cycle in range(len(tasks)+3):
+            ready=[t for t in tasks if r.entry(t['id']).get('stage') not in
+                ('DONE','BLOCKED','NEEDS_USER') and all(r.entry(dep).get('stage')=='DONE' for dep in t['dependencies'])]
+            recoverable=[t for t in tasks if r.entry(t['id']).get('stage')=='BLOCKED'
+                and int(r.entry(t['id']).get('blocker_recovery_attempts') or 0)<2
                 and all(r.entry(dep).get('stage')=='DONE' for dep in t['dependencies'])]
+            eligible=ready+recoverable
             if args.task_id:eligible=[t for t in eligible if t['id']==args.task_id]
             if not eligible:break
             selected=eligible[:args.max_parallel]
+            def execute(task):
+                if r.entry(task['id']).get('stage')=='BLOCKED':
+                    outcome=r._blocked_resolution(task)
+                    if outcome['state']=='NEEDS_USER':return outcome
+                return r.run_one(task)
             with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-                futures={pool.submit(r.run_one,t):t for t in selected}
+                futures={pool.submit(execute,t):t for t in selected}
                 for future in as_completed(futures):
                     task=futures[future]
-                    try:print(json.dumps(future.result(),ensure_ascii=False))
+                    try:
+                        result=future.result()
+                        print(json.dumps(result,ensure_ascii=False),flush=True)
                     except Exception as e:
                         ec=exit_code(e);code=max(code,ec)
-                        if ec==2:r.record(task['id'],'BLOCKED',stage='BLOCKED',reason=str(e)[:500])
-                        r.journal.event('ERROR',task['id'],{'code':ec,'kind':type(e).__name__,'message':str(e)[:350]})
+                        prev=r.entry(task['id'])
+                        if ec==2 and prev.get('stage') not in ('NEEDS_USER',):
+                            r.record(task['id'],'BLOCKED',stage='BLOCKED',
+                                     reason=str(e)[:500],blocked_from_stage=prev.get('stage'))
+                        r.journal.event('ERROR',task['id'],{'code':ec,'kind':type(e).__name__,
+                            'message':str(e)[:350]})
                         print(f'[RUNNER_ERROR:{ec}] {task["id"]}: {type(e).__name__}: {e}',file=sys.stderr)
             if args.once or args.task_id:break
             if code in (70,75,76):break
-        return code
+        # Any task exhausting automatic recovery is an explicit unresolved
+        # dependency; do not make it disappear behind a zero exit status.
+        for task in tasks:
+            record=r.entry(task['id'])
+            if record.get('stage')=='BLOCKED' and int(record.get('blocker_recovery_attempts') or 0)>=2:
+                r.record(task['id'],'BLOCKER_ATTEMPTS_EXHAUSTED',stage='NEEDS_USER',
+                         blocked_reason=record.get('reason','Sem avanço após duas tentativas'))
+        summary={stage:sum(1 for v in r.state['tasks'].values() if v.get('stage')==stage)
+                 for stage in ('DONE','BLOCKED','NEEDS_USER')}
+        print('[GOJOB_QUEUE] '+json.dumps(summary,ensure_ascii=False),flush=True)
+        # A quiet supervisor run is not evidence that blocked tasks succeeded.
+        if summary['NEEDS_USER'] or summary['BLOCKED']:
+            attention={tid:{'stage':v.get('stage'),'reason':v.get('blocked_reason') or v.get('reason') or 'Consultar journal',
+                            'pr':v.get('pr'),'review_rounds':v.get('review_rounds_total',0)}
+                       for tid,v in r.state['tasks'].items() if v.get('stage') in ('NEEDS_USER','BLOCKED')}
+            print('[GOJOB_ATTENTION] '+json.dumps(attention,ensure_ascii=False)[:2500],file=sys.stderr)
+            # A documented human gate is not a Python/systemd process crash.
+            # The supervisor should continue monitoring other independent work.
+            if code not in (70,75,76):return 0
+        return code if code!=2 else 0
 
 if __name__=='__main__':sys.exit(main())

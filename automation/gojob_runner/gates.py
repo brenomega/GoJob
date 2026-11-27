@@ -25,7 +25,7 @@ def check(root=None):
     definition=json.loads(schema.read_text(encoding='utf-8'))
     if 'failure_modes' not in definition.get('required',[]):
         raise RuntimeError('Oráculos independentes do Test Engineer não exigidos')
-    tasks=root/'product_seed'/'docs'/'BACKLOG.json' 
+    tasks=root/'product_seed'/'docs'/'BACKLOG.json'
     if tasks.exists():
         entries=json.loads(tasks.read_text(encoding='utf-8'))['tasks']
         if not entries or len({x['id'] for x in entries})!=len(entries):

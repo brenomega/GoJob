@@ -1,1 +1,57 @@
-{"type":"object","properties":{"head_sha":{"type":"string"},"base_sha":{"type":"string"},"decision":{"type":"string","enum":["PASS","REVISE","STOP"]},"rationale":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"opportunity_cost":{"type":"string"},"alternative":{"type":"string"},"north_star_impact":{"type":"string"}},"required":["head_sha","base_sha","decision","rationale","findings","opportunity_cost","alternative","north_star_impact"],"additionalProperties":false}
+{
+  "type": "object",
+  "properties": {
+    "head_sha": {
+      "type": "string"
+    },
+    "base_sha": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "REVISE",
+        "STOP"
+      ]
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "opportunity_cost": {
+      "type": "string"
+    },
+    "alternative": {
+      "type": "string"
+    },
+    "north_star_impact": {
+      "type": "string"
+    },
+    "blocking_kind": {
+      "type": "string",
+      "enum": [
+        "FIXABLE",
+        "HUMAN_DECISION",
+        "FORBIDDEN_ACTION",
+        "EXTERNAL_DEPENDENCY"
+      ]
+    }
+  },
+  "required": [
+    "head_sha",
+    "base_sha",
+    "decision",
+    "rationale",
+    "findings",
+    "opportunity_cost",
+    "alternative",
+    "north_star_impact"
+  ],
+  "additionalProperties": false
+}
