@@ -55,11 +55,53 @@ class Reviews(unittest.TestCase):
     def test_merge_requires_exact_previously_approved_head_at_github(self):
         gh=GitHub('/tmp')
         with patch.object(gh,'snapshot',return_value={}),\
-             patch.object(gh,'checks',return_value=[{'name':'verify'}]),\
+             patch.object(gh,'checks',return_value={'app_id':1}),             patch.object(gh,'_api',return_value={'enforce_admins':{'enabled':True},
+                 'required_status_checks':{'strict':True,'checks':[{'context':'verify','app_id':1}]}}),             patch.object(gh,'confirm_merge'),\
              patch.object(gh,'gh',return_value='') as cli,\
              patch.object(gh,'pr',return_value={'state':'MERGED','mergeCommit':{'oid':'merged'}}):
             gh.merge(7,'docs/0.1.1-prova','head123','base456')
         cli.assert_called_with('pr','merge','7','--merge','--match-head-commit','head123')
+
+    def test_ci_requires_workflow_attempt_job_and_exact_pr_head_and_base(self):
+        from copy import deepcopy
+        from gojob_runner.merge_evidence import verify_ci
+        run={'id':19,'run_attempt':2,'event':'pull_request','head_sha':'head','name':'gojob-verify',
+             'path':'.github/workflows/ci.yml@refs/pull/18/merge','status':'completed','conclusion':'success',
+             'pull_requests':[{'number':18,'base':{'ref':'develop','sha':'base'},'head':{'sha':'head'}}]}
+        job={'id':31,'run_id':19,'name':'verify','status':'completed','conclusion':'success',
+             'check_run_url':'https://api.github.com/repos/owner/repo/check-runs/31'}
+        check={'id':31,'name':'verify','head_sha':'head','conclusion':'success',
+               'app':{'id':15368,'slug':'github-actions'}}
+        events={'actions/workflows/ci.yml/runs?event=pull_request&head_sha=head&per_page=100':{'workflow_runs':[run]},
+                'actions/runs/19/attempts/2/jobs':{'jobs':[job]},'check-runs/31':check}
+        proof=verify_ci(events.__getitem__,18,'head','base')
+        self.assertEqual((proof['base'],proof['run_attempt'],proof['job_id']),('base',2,31))
+        self.assertIsNone(verify_ci(events.__getitem__,19,'head','base'))
+        self.assertIsNone(verify_ci(events.__getitem__,18,'head','concurrent-base'))
+        snapshot=deepcopy(events)
+        run['path']='.github/workflows/unrelated.yml'
+        self.assertIsNone(verify_ci(events.__getitem__,18,'head','base'))
+        job=snapshot['actions/runs/19/attempts/2/jobs']['jobs'][0]
+        job['name']='arbitrary green status'
+        with self.assertRaisesRegex(ValueError,'job verify'):
+            verify_ci(snapshot.__getitem__,18,'head','base')
+        job['name']='verify'
+        snapshot['check-runs/31']['app']['slug']='another-app'
+        with self.assertRaisesRegex(ValueError,'origem'):
+            verify_ci(snapshot.__getitem__,18,'head','base')
+
+    def test_merge_without_strict_server_protection_never_calls_github_merge(self):
+        from gojob_runner.tools import MergeProtectionRequired
+        gh=GitHub('/tmp')
+        settings={'enforce_admins':{'enabled':False},
+                  'required_status_checks':{'strict':True,'checks':[{'context':'verify','app_id':1}]}}
+        with (patch.object(gh,'checks',return_value={'app_id':1}),
+              patch.object(gh,'_api',return_value=settings),
+              patch.object(gh,'gh') as cli):
+            with self.assertRaises(MergeProtectionRequired):
+                gh.merge(7,'docs/0.1.1-prova','head','base')
+            cli.assert_not_called()
+
 
     def test_task_graph_rejects_cycle(self):
         import json
