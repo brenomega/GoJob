@@ -20,6 +20,7 @@ class Recovery(unittest.TestCase):
               patch.object(s,'notify',return_value=False)):
             self.assertEqual(s.main(self.args()),2)
             repair.assert_not_called()
+            self.assertTrue(any((self.home/'home'/'incidents').glob('*/incident.json')))
     def test_crash_routes_to_independent_repair_then_resumes(self):
         failed=SimpleNamespace(returncode=70,stdout='',stderr='KeyError: lost checkpoint')
         ok=SimpleNamespace(returncode=0,stdout='task DONE',stderr='')
