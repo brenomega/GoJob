@@ -96,7 +96,7 @@ def product_code_changes(repo,base_sha):
     changed=git(repo,'diff','--name-only',f'{base_sha}..HEAD').splitlines()
     extensions=('.py','.ts','.tsx','.js','.jsx','.java','.go','.rs','.kt','.cs')
     return [path for path in changed if (path.endswith(extensions)
-            and not path.startswith(('automation/','scripts/','docs/'))
+            and not path.startswith(('automation/','docs/'))
             and not is_product_test_path(path))]
 
 def verify_product(repo, task, base_sha, timeout=600):
@@ -257,7 +257,7 @@ class GitHub:
     def merge(self,pr,branch,head,base):
         self.snapshot(pr,branch,head,base,attempts=1)
         self.checks(pr,head,base,branch,timeout=60)
-        self.gh('pr','merge',str(pr),'--merge')
+        self.gh('pr','merge',str(pr),'--merge','--match-head-commit',head)
         item=self.pr(pr)
         if item.get('state')!='MERGED' or not item.get('mergeCommit'):
             raise TransientFailure('Resultado do merge incerto: reconciliar antes de repetir')

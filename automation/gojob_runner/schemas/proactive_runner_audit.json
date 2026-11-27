@@ -1,0 +1,15 @@
+{
+  "type":"object",
+  "additionalProperties":false,
+  "properties":{
+    "decision":{"type":"string","enum":["NO_ACTION","REPAIR_RUNNER","FOLLOW_UP"]},
+    "summary":{"type":"string"},
+    "evidence":{"type":"array","items":{"type":"string"}},
+    "hypothesis":{"type":"string"},
+    "reproduction":{"type":"string"},
+    "expected_failure":{"type":"string"},
+    "priority":{"type":"string","enum":["critical","high","medium","low"]},
+    "proposed_tests":{"type":"array","items":{"type":"string"}}
+  },
+  "required":["decision","summary","evidence","hypothesis","reproduction","expected_failure","priority","proposed_tests"]
+}
