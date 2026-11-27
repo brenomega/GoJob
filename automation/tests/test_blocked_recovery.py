@@ -2,8 +2,9 @@
 from __future__ import annotations
 import tempfile,unittest,subprocess,shutil
 from pathlib import Path
+from unittest.mock import patch
 from gojob_runner.runner import Runner
-from gojob_runner.tools import git,PolicyFailure
+from gojob_runner.tools import git,PolicyFailure,TransientFailure
 
 
 class SpecialistCodex:
@@ -91,8 +92,8 @@ class BlockedRecovery(unittest.TestCase):
         git(self.work,'add','.');git(self.work,'commit','-m','docs(auditoria): registre estudo inicial [#0.1.2]')
         old=git(self.work,'rev-parse','HEAD')
         self.runner.record('0.1.2','REVIEW_BLOCK',stage='BLOCKED',pr=5,
-                           review_head=old,strategic={'decision':'REVISE','findings':['Falta prova de estágio de verão']},
-                           technical={'decision':'REVISE','findings':['Oráculo insuficiente']},
+                           review_head=old,strategic={'decision':'REVISE','blocking_kind':'FIXABLE','rationale':'Achado acionável com evidência','findings':['Falta prova de estágio de verão']},
+                           technical={'decision':'REVISE','blocking_kind':'FIXABLE','rationale':'Achado acionável com evidência','findings':['Oráculo insuficiente']},
                            findings={'strategic':['Falta prova de estágio de verão'],
                                      'technical':['Oráculo insuficiente']},
                            reason='Reparo não concluído')
@@ -141,5 +142,113 @@ class BlockedRecovery(unittest.TestCase):
         self.runner.record('0.1.2','BUDGET',stage='BLOCKED',blocker_recovery_attempts=2)
         self.assertEqual(self.runner._blocked_resolution(self.task)['state'],'NEEDS_USER')
         self.assertFalse(self.codex.calls)
+
+
+    def review_checkpoint(self, decision, round_number, kind='FIXABLE'):
+        (self.work/'docs/AUDITORIA.md').write_text('Análise verificável.\n')
+        git(self.work,'add','.')
+        git(self.work,'commit','-m','docs(auditoria): registre estudo inicial [#0.1.2]')
+        head=git(self.work,'rev-parse','HEAD')
+        common={'head_sha':head,'base_sha':self.base,'findings':[],
+                'rationale':'Análise independente do snapshot', 'blocking_kind':'FIXABLE'}
+        row={'head':head,'base':self.base,'pr':5,'round':round_number,
+             'strategic':dict(common,decision=decision,blocking_kind=kind,
+                              findings=['Explique a origem dos dados'] if decision!='PASS' else [],
+                              alternative='observar fonte',opportunity_cost='tempo',north_star_impact='cobertura'),
+             'technical':dict(common,decision='ACCEPT',tests_assessed=['baseline'],real_evidence=['Git'])}
+        self.runner.record('0.1.2','REVIEW',stage='REVIEW',pr=5,issue=4,head=head,
+                           review_head=head,review_history=[row],review_rounds_total=round_number,
+                           strategic=row['strategic'],technical=row['technical'])
+        return head, common
+
+    def test_third_round_approval_resumes_before_ci_without_review_or_dev(self):
+        head,_=self.review_checkpoint('PASS',3)
+        with (patch.object(self.runner,'_verify',return_value=({'head':head},{})),
+              patch.object(self.runner,'_agent') as agent,
+              patch.object(self.runner.scm,'snapshot',create=True),
+              patch.object(self.runner.scm,'checks',create=True,side_effect=TransientFailure('CI pendente')) as ci):
+            with self.assertRaisesRegex(TransientFailure,'CI pendente'):
+                self.runner.run_one(self.task)
+            ci.assert_called_once_with(5,head,self.base,self.branch)
+            agent.assert_not_called()
+        self.assertEqual(self.runner.entry('0.1.2')['review_rounds_total'],3)
+
+    def test_veto_persisted_before_stage_transition_prevents_any_write_agent(self):
+        self.review_checkpoint('REVISE',1,kind='HUMAN_DECISION')
+        with patch.object(self.runner,'_agent') as agent:
+            for _ in range(2):
+                with self.assertRaisesRegex(PolicyFailure,'Explique a origem'):
+                    self.runner.run_one(self.task)
+            agent.assert_not_called()
+        self.assertEqual(self.runner.entry('0.1.2')['stage'],'NEEDS_USER')
+
+    def test_rejected_sha_resumes_correction_then_ci_and_reconciles_interrupted_merge(self):
+        head,common=self.review_checkpoint('REVISE',1)
+        pending=self.work/'docs/AUDITORIA.md'
+        pending.write_text('Análise verificável.\nEdição preservada da sessão interrompida.\n')
+
+        class Hosting:
+            def __init__(hosting):
+                hosting.remote={'state':'OPEN'}
+                hosting.merges=0
+                hosting.closed=[]
+            def pr(hosting,number):
+                return hosting.remote
+            def snapshot(hosting,pr,branch,head,base):
+                return {}
+            def checks(hosting,pr,head,base,branch):
+                self.assertEqual(git(self.repo,'rev-parse','origin/'+branch),head)
+                return {'pr':pr,'head':head,'base':base}
+            def comment(hosting,*args):
+                pass
+            def merge(hosting,pr,branch,head,base):
+                hosting.merges+=1
+                git(self.repo,'merge','--no-ff','-m','integrate reviewed snapshot',head)
+                git(self.repo,'push','origin','develop')
+                oid=git(self.repo,'rev-parse','HEAD')
+                hosting.remote={'state':'MERGED','mergeCommit':{'oid':oid},
+                                'headRefOid':head,'headRefName':branch,'baseRefName':'develop'}
+                raise KeyboardInterrupt
+            def confirm_merge(hosting,remote,branch,head,base):
+                from gojob_runner.merge_evidence import reconcile_merge
+                return reconcile_merge(lambda *args:git(self.repo,*args),remote,
+                                       head=head,base=base,branch=branch)
+            def issue_close(hosting,number):
+                self.assertEqual(self.runner.entry('0.1.2')['stage'],'MERGED')
+                hosting.closed.append(number)
+
+        self.runner.scm=hosting=Hosting()
+        roles=[]
+        def agent(role,prompt,work,schema,write=False):
+            roles.append(role)
+            if role=='developer-repair':
+                self.assertTrue(write)
+                self.assertIn('Edição preservada',pending.read_text())
+                self.assertIn('Explique a origem',prompt)
+                pending.write_text(pending.read_text()+'Origem confirmada.\n')
+                return {'status':'DONE','commit_plan':[{
+                    'message':'docs(auditoria): confirme origem dos dados [#0.1.2]',
+                    'paths':['docs/AUDITORIA.md']}]}
+            sha=git(self.work,'rev-parse','HEAD')
+            self.assertNotEqual(sha,head)
+            fields=dict(common,head_sha=sha)
+            if role=='strategic-reviewer':
+                return dict(fields,decision='PASS',alternative='fonte',opportunity_cost='tempo',north_star_impact='cobertura')
+            if role=='technical-reviewer':
+                return dict(fields,decision='ACCEPT',tests_assessed=['gates'],real_evidence=['Git'])
+            if role=='integrator':
+                return dict(fields,decision='MERGE')
+            self.fail('unexpected agent '+role)
+        with (patch.object(self.runner,'_verify',side_effect=lambda *_:({'head':git(self.work,'rev-parse','HEAD')},{})),
+              patch.object(self.runner,'_agent',side_effect=agent)):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runner.run_one(self.task)
+        self.assertEqual(roles,['developer-repair','strategic-reviewer','technical-reviewer','integrator'])
+        self.assertEqual(hosting.closed,[])
+        self.assertEqual(self.runner.entry('0.1.2')['review_rounds_total'],2)
+        self.runner=Runner(self.repo,self.root/'state',codex=self.codex,scm=hosting)
+        self.assertEqual(self.runner.run_one(self.task)['state'],'DONE')
+        self.assertEqual(hosting.merges,1)
+        self.assertEqual(hosting.closed,[4])
 
 if __name__=='__main__':unittest.main()

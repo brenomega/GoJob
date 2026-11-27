@@ -4,12 +4,12 @@ from gojob_runner.review_policy import disposition,review_feedback,MAX_REVIEW_RO
 
 class ReviewPolicy(unittest.TestCase):
     def setUp(self):
-        self.s={'decision':'STOP','rationale':'A direção precisa de ajuste concreto',
+        self.s={'decision':'STOP','blocking_kind':'FIXABLE','rationale':'A direção precisa de ajuste concreto',
                 'findings':['A solução não mede recall de programas de verão'],
                 'north_star_impact':'Reduz cobertura de vagas TI',
                 'opportunity_cost':'Deixa fontes relevantes de fora',
                 'alternative':'Medir corpus independente primeiro'}
-        self.t={'decision':'ACCEPT','rationale':'Código compila e testes exercitados',
+        self.t={'decision':'ACCEPT','blocking_kind':'FIXABLE','rationale':'Código compila e testes exercitados',
                 'findings':[],'real_evidence':['diff real'],'tests_assessed':['suite existente']}
     def test_stop_actionable_is_not_a_terminal_failure(self):
         self.assertEqual(disposition(self.s,self.t).action,'REPAIR')
