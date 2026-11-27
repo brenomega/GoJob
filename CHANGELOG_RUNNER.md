@@ -1,24 +1,22 @@
-# GoJob Runner — CHANGELOG
+# GoJob Runner v4.0.0 — release recuperável e plano de controle independente
 
-## 3.1.1 — 2026-11-26
-- Corrige UX de instalação e inicialização: `quickstart.py` reúne preflight, autenticação quando necessário, teste do runner, clone, bootstrap inicial idempotente e ativação do supervisor.
-- O primeiro ciclo é disparado por systemd imediatamente, sem exigir `--task-id`, e a fila prossegue automaticamente nos próximos ciclos.
-- Mantém bloqueios seguros em caso de ferramentas ausentes, identidade divergente e repositório preexistente incompatível.
+## 4.0.0 — 27/11/2026
 
-## 3.1.0 — 2026-11-26
-- Correção procedural do runner: autoria de testes do produto atribuída explicitamente a Test Engineer Codex independente, antes dos gates e da revisão, sem produção/testes do produto nesta distribuição.
-- Recuperação de edições interrompidas, reconciliação de base e validação de evidências de revisão/CI continuam obrigatórias.
-- Runner e supervisor compartilham agora a mesma raiz de estado identificada por repositório; evolução também fica isolada por repositório.
-- Gates suportam projetos com mais de um stack, sem deixar testes de extensão sem executar porque há backend Python.
-- Regras e testes de regressão desta release avaliam o comportamento do **orquestrador**, não implementações de GoJob.
+### Falha raiz
+- PR #11 (v3.4.2): implementador reportou código concluído e testes locais aprovados, mas `systemctl --user` foi negado no sandbox. O controlador interpretava `BLOCKED` como erro terminal e abortava a instalação, embora o supervisor novo ainda não estivesse instalado.
+- V3.x dependia de atualizador síncrono e de um supervisor anterior para corrigir uma versão que ainda não tinha sido publicada; seus incidentes de instalação não chegavam ao Codex reparador.
 
-## 3.0.0 — 2026-11-26
-- Primeira release independente do **runner de desenvolvimento**, não do produto GoJob.
-- Pipeline Codex gpt-6.2-sol/high: tarefas EAP, Issue, branch, developer, oráculos, gates da base, PR, revisão estratégica+técnica, CI, integrator, merge commit, fechamento da Issue.
-- Controller controla GitHub usando a conta do usuário; parecer independente não finge ser GitHub APPROVE.
-- State/Journal persistente, locks, worktrees isoladas, tentativa bounded de repairs, replay controlado, supervisor externo com reparador independente.
-- Backlog e contexto do produto, sem gerar código de GoJob: Codex é responsável pelo desenvolvimento do produto.
-- Versão aplica-se SOMENTE ao runner: patch=y para bug, minor=x para erro procedural transversal, major para novas funcionalidades bruscas.
+### Mudanças estruturais
+- Introduz `release_control.py`: estados duráveis de release, journal JSONL privado, locks de processo, captura de Git, diff, documentos, feedback, saídas redigidas dos agentes e relatórios de erro em dossiê com SHA-256 e armazenamento atômico.
+- Introduz `release_agent_recovery.py`: diagnóstico read-only por Codex Sol/High e até dois implementadores de recuperação por bloqueio; orçamento separado das três rodadas de Reviewer. Erros inesperados do controlador também geram diagnóstico independente quando o Codex está disponível.
+- Introduz `release_worker.py`: pacote específico imutável por versão, serviço e timer systemd de atualização com execução independente do supervisor antigo, backoff por falha e estado `NEEDS_USER` quando não há progresso seguro.
+- `quickstart.py`: instala o controlador antes da atualização; em falha de upgrade agenda retomada sem afirmar instalação concluída; pré-verificação com isolamento de módulos/testes de integração em subprocessos.
+- `upgrade_runner.py`: Developer `BLOCKED` passa para diagnóstico e reparador, sem pular gates. Diferencia release publicada (VERIFYING) de instalada (INSTALLED); reconciliação após merge. As revisões mantêm HEAD SHA, CI e limite de três rodadas.
+- `bootstrap.py`: publica só arquivos de runner/protocolo/testes e arquitetura; não produz código do GoJob.
+- Testes de integração abrangem Git real, handoff entre agentes, bloqueio do systemd no sandbox, dossiês, retries, exclusividade, implementação após rejeição, retenção do PR e verificação de promoção pós-merge.
 
-### Limites de validação
-- Testes locais offline não certificam a operação do Codex/GitHub/BigLinux; obrigatória prova real do primeiro ciclo, mantendo `main` estável.
+### Limites
+- Em falta de Codex, GitHub, disco, rede ou host systemd, a coleta/retomada será de melhor esforço. Nenhuma política humana é contornada; não há garantia de reparo de toda falha, nem equivalência entre testes offline e execução real no BigLinux.
+- Código gerado ainda requer gates e revisão. Falhas do instalador *antes da instalação do worker* continuam um risco de bootstrap, agora mitigado por validação local anterior.
+
+Versões anteriores (3.1.1–3.4.2) continuam preservadas no histórico e nos PRs existentes. Este pacote usa nova branch de atualização e não modifica diretamente o código do produto.
