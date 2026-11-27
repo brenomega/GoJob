@@ -5,6 +5,13 @@ from unittest.mock import patch
 from gojob_runner import context as ctx
 from gojob_runner.tools import verify_product,PolicyFailure
 
+class ProductChangeDetection(unittest.TestCase):
+    def test_new_scripts_scraper_is_product_code_not_runner_infrastructure(self):
+        from unittest.mock import patch
+        from gojob_runner.tools import product_code_changes
+        with patch('gojob_runner.tools.git',return_value='scripts/scraper.py\n'):
+            self.assertEqual(product_code_changes('/tmp','base'),['scripts/scraper.py'])
+
 class ContextTests(unittest.TestCase):
     def test_base_context_does_not_trust_modified_branch_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
