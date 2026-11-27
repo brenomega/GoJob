@@ -52,6 +52,15 @@ class Reviews(unittest.TestCase):
              patch('gojob_runner.tools.time.sleep'):
             with self.assertRaises(TransientFailure):
                 gh.checks(18,'head','base','feat/1.1-test',timeout=1)
+    def test_merge_requires_exact_previously_approved_head_at_github(self):
+        gh=GitHub('/tmp')
+        with patch.object(gh,'snapshot',return_value={}),\
+             patch.object(gh,'checks',return_value=[{'name':'verify'}]),\
+             patch.object(gh,'gh',return_value='') as cli,\
+             patch.object(gh,'pr',return_value={'state':'MERGED','mergeCommit':{'oid':'merged'}}):
+            gh.merge(7,'docs/0.1.1-prova','head123','base456')
+        cli.assert_called_with('pr','merge','7','--merge','--match-head-commit','head123')
+
     def test_task_graph_rejects_cycle(self):
         import json
         with tempfile.TemporaryDirectory() as tmp:
