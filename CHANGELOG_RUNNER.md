@@ -1,24 +1,49 @@
-# GoJob Runner — CHANGELOG
+# GoJob Runner v4.1.0 — execução desacoplada e produtividade verificável
 
-## 3.1.1 — 2026-11-26
-- Corrige UX de instalação e inicialização: `quickstart.py` reúne preflight, autenticação quando necessário, teste do runner, clone, bootstrap inicial idempotente e ativação do supervisor.
-- O primeiro ciclo é disparado por systemd imediatamente, sem exigir `--task-id`, e a fila prossegue automaticamente nos próximos ciclos.
-- Mantém bloqueios seguros em caso de ferramentas ausentes, identidade divergente e repositório preexistente incompatível.
+## 4.1.0 — 27/11/2026
 
-## 3.1.0 — 2026-11-26
-- Correção procedural do runner: autoria de testes do produto atribuída explicitamente a Test Engineer Codex independente, antes dos gates e da revisão, sem produção/testes do produto nesta distribuição.
-- Recuperação de edições interrompidas, reconciliação de base e validação de evidências de revisão/CI continuam obrigatórias.
-- Runner e supervisor compartilham agora a mesma raiz de estado identificada por repositório; evolução também fica isolada por repositório.
-- Gates suportam projetos com mais de um stack, sem deixar testes de extensão sem executar porque há backend Python.
-- Regras e testes de regressão desta release avaliam o comportamento do **orquestrador**, não implementações de GoJob.
+### Incidente diagnosticado
+- Entre 13h20 e 15h44, PR #13 publicou oito commits e duas rodadas de revisões `REVISE`, mas nenhum merge. A segunda reparação executava `codex exec` síncrono quando o usuário pressionou Ctrl+C; parte do estado ficava no Git local e a sessão não fornecia sinal de vida durante o processamento.
+- O instalador repetia autenticação e 134 testes a cada invocação, aguardava Developer/revisores e não oferecia monitoramento conciso. Reviewer estratégico e técnico rodavam sequencialmente, e a revisão de uma rodada só recebia checkpoint depois dos dois resultados; uma interrupção provocava custo duplicado.
+- CI só era checado após reviews caros, desperdiçando tokens em commits rejeitados deterministicamente. A release com oito commits não tinha margem para outro reparo, mas o sistema poderia ainda convocar implementador desnecessariamente.
 
-## 3.0.0 — 2026-11-26
-- Primeira release independente do **runner de desenvolvimento**, não do produto GoJob.
-- Pipeline Codex gpt-6.2-sol/high: tarefas EAP, Issue, branch, developer, oráculos, gates da base, PR, revisão estratégica+técnica, CI, integrator, merge commit, fechamento da Issue.
-- Controller controla GitHub usando a conta do usuário; parecer independente não finge ser GitHub APPROVE.
-- State/Journal persistente, locks, worktrees isoladas, tentativa bounded de repairs, replay controlado, supervisor externo com reparador independente.
-- Backlog e contexto do produto, sem gerar código de GoJob: Codex é responsável pelo desenvolvimento do produto.
-- Versão aplica-se SOMENTE ao runner: patch=y para bug, minor=x para erro procedural transversal, major para novas funcionalidades bruscas.
+### Correções
+- `quickstart.py` inicia `gojob-runner-release.service` via systemd `--no-block`, em vez de executar loops de revisão no terminal. Fechar o terminal deixa o serviço em execução; existe modo explícito `--foreground` para diagnóstico e `--status` sem login.
+- Revisores independentes executam em paralelo, cada parecer é salvo atomicamente ao concluir (por SHA/base/papel), e a retomada reaproveita apenas resultados válidos. O histórico de objeções é enviado às próximas rodadas para reduzir mudanças arbitrárias de escopo.
+- CI do HEAD é verificado antes da revisão de agentes. O orçamento de oito commits é examinado antes de invocar outro implementador; não se contorna a regra com push/force-push.
+- Codex em serviço publica heartbeat e duração a cada 20s; saída temporária privada é limitada e removida, e subprocessos são encerrados em timeout/interrupção. O journal mantém o estado para reconciliação posterior.
+- Lock de release compartilhado entre versões atuais; novas versões não disputam alterações de `develop`. O timer não reinstala uma versão já marcada como ativada.
+- Cache por fingerprint SHA-256 (sources + testes + ambiente Python) evita repetir a suíte do mesmo pacote na mesma máquina; `GOJOB_FORCE_VERIFY=1` força auditoria integral.
+- Testes adversariais de reinício entre revisores, CI antes de review, paralelismo, limite de commits, cache e interrupção de processo filho.
 
-### Limites de validação
-- Testes locais offline não certificam a operação do Codex/GitHub/BigLinux; obrigatória prova real do primeiro ciclo, mantendo `main` estável.
+### Limites
+- Codex, GitHub e systemd reais não são exercitados nos testes offline; a atualização remota e o progresso do PR precisam ser observados após implantação.
+- Um PR já esgotado em oito commits e reprovado permanece preservado e exige continuação em nova release ou decisão; o controlador não burla orçamento nem revisão.
+- Versões anteriores do worker em execução podem concluir a tentativa já iniciada; systemd aplica a nova unidade em ciclos subsequentes.
+
+---
+
+# GoJob Runner v4.1.0 — release recuperável e plano de controle independente
+
+## 4.0.0 — 27/11/2026
+
+### Falha raiz
+- PR #11 (v3.4.2): implementador reportou código concluído e testes locais aprovados, mas `systemctl --user` foi negado no sandbox. O controlador interpretava `BLOCKED` como erro terminal e abortava a instalação, embora o supervisor novo ainda não estivesse instalado.
+- V3.x dependia de atualizador síncrono e de um supervisor anterior para corrigir uma versão que ainda não tinha sido publicada; seus incidentes de instalação não chegavam ao Codex reparador.
+
+### Mudanças estruturais
+- Introduz `release_control.py`: estados duráveis de release, journal JSONL privado, locks de processo, captura de Git, diff, documentos, feedback, saídas redigidas dos agentes e relatórios de erro em dossiê com SHA-256 e armazenamento atômico.
+- Introduz `release_agent_recovery.py`: diagnóstico read-only por Codex Sol/High e até dois implementadores de recuperação por bloqueio; orçamento separado das três rodadas de Reviewer. Erros inesperados do controlador também geram diagnóstico independente quando o Codex está disponível.
+- Introduz `release_worker.py`: pacote específico imutável por versão, serviço e timer systemd de atualização com execução independente do supervisor antigo, backoff por falha e estado `NEEDS_USER` quando não há progresso seguro.
+- `quickstart.py`: instala o controlador antes da atualização; em falha de upgrade agenda retomada sem afirmar instalação concluída; pré-verificação com isolamento de módulos/testes de integração em subprocessos.
+- `upgrade_runner.py`: Developer `BLOCKED` passa para diagnóstico e reparador, sem pular gates. Diferencia release publicada (VERIFYING) de instalada (INSTALLED); reconciliação após merge. As revisões mantêm HEAD SHA, CI e limite de três rodadas.
+- `bootstrap.py`: publica só arquivos de runner/protocolo/testes e arquitetura; não produz código do GoJob.
+- Testes de integração abrangem Git real, handoff entre agentes, bloqueio do systemd no sandbox, dossiês, retries, exclusividade, implementação após rejeição, retenção do PR e verificação de promoção pós-merge.
+
+### Limites
+- Em falta de Codex, GitHub, disco, rede ou host systemd, a coleta/retomada será de melhor esforço. Nenhuma política humana é contornada; não há garantia de reparo de toda falha, nem equivalência entre testes offline e execução real no BigLinux.
+- Código gerado ainda requer gates e revisão. Falhas do instalador *antes da instalação do worker* continuam um risco de bootstrap, agora mitigado por validação local anterior.
+
+Versões anteriores (3.1.1–3.4.2) continuam preservadas no histórico e nos PRs existentes. Este pacote usa nova branch de atualização e não modifica diretamente o código do produto.
+
+- Continuidade de revisão: consulta read-only da candidata anterior PR #13; histórico e correções anteriores enviados como evidência aos agentes da nova release, sem merge não aprovado.
