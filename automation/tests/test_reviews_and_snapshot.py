@@ -67,7 +67,7 @@ class Reviews(unittest.TestCase):
 
     def test_ci_requires_workflow_attempt_job_and_exact_pr_head_and_base(self):
         from copy import deepcopy
-        from gojob_runner.merge_evidence import verify_ci
+        from gojob_runner.merge_evidence import VerifiedCIFailure, verify_ci
         run={'id':19,'run_attempt':2,'check_suite_id':123,'event':'pull_request','head_sha':'head','name':'gojob-verify',
              'path':'.github/workflows/ci.yml@refs/pull/18/merge','status':'completed','conclusion':'success',
              'pull_requests':[{'number':18,'base':{'ref':'develop','sha':'base'},'head':{'sha':'head'}}]}
@@ -82,6 +82,20 @@ class Reviews(unittest.TestCase):
         self.assertIsNone(verify_ci(events.__getitem__,19,'head','base'))
         self.assertIsNone(verify_ci(events.__getitem__,18,'head','concurrent-base'))
         snapshot=deepcopy(events)
+        failed=deepcopy(events)
+        failed_run=next(iter(failed.values()))['workflow_runs'][0]
+        failed_job=failed['actions/runs/19/attempts/2/jobs']['jobs'][0]
+        failed_check=failed['check-runs/31']
+        for entry in (failed_run,failed_job,failed_check):
+            entry['conclusion']='failure'
+        failed_job['steps']=[{'name':'Baseline and runner tests','conclusion':'failure'}]
+        with self.assertRaises(VerifiedCIFailure) as result:
+            verify_ci(failed.__getitem__,18,'head','base')
+        self.assertEqual(result.exception.evidence,{**proof,'failed_steps':['Baseline and runner tests']})
+        failed_check['app']['slug']='untrusted-check'
+        with self.assertRaises(ValueError) as result:
+            verify_ci(failed.__getitem__,18,'head','base')
+        self.assertNotIsInstance(result.exception,VerifiedCIFailure)
         run['path']='.github/workflows/unrelated.yml'
         self.assertIsNone(verify_ci(events.__getitem__,18,'head','base'))
         job=snapshot['actions/runs/19/attempts/2/jobs']['jobs'][0]

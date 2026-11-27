@@ -17,6 +17,7 @@ from gojob_runner.tools import MergeProtectionRequired
 from install_supervisor import service, systemctl, unit_pair
 from release_control import ReleaseLedger, atomic_json, scrub
 from release_package import build_package, supervisor_dir, verify_package
+from service_execution import invocation_id
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = (ROOT/'RUNNER_VERSION').read_text().strip()
@@ -38,33 +39,47 @@ def install_release_worker(repo, source_sha, *, enable=True, home=None, units=No
     return {'package': str(package), 'commit': source_sha, 'enabled': enable}
 
 
-def once(repo, *, ledger=None, units=None):
+def once(repo, *, ledger=None, units=None, resume_merge_protection=None):
     from quickstart import enable_automation
-    from upgrade_runner import upgrade
+    from upgrade_runner import resume_protected_merge, upgrade
 
     ledger = ledger or ReleaseLedger(VERSION)
     with ledger.exclusive() as acquired:
         if not acquired:
             return {'status': 'ALREADY_RUNNING'}
         previous = ledger.status()
-        if previous.get('state') == 'NEEDS_USER':
+        if resume_merge_protection and (not OID.fullmatch(resume_merge_protection)
+            or previous.get('state') != 'NEEDS_USER' or previous.get('event') != 'merge_protection_required'):
+            return {'status': 'NEEDS_USER', 'reason': 'Retomada exige o SHA e um bloqueio de proteção de merge'}
+        if previous.get('state') == 'NEEDS_USER' and not resume_merge_protection:
             return {'status': 'NEEDS_USER'}
-        if previous.get('state') == 'INSTALLED' and OID.fullmatch(previous.get('details', {}).get('merge', '')):
-            return {'status': 'INSTALLED', 'merge': previous['details']['merge']}
+        details = previous.get('details', {})
+        if (previous.get('state') == 'INSTALLED' and OID.fullmatch(details.get('merge', ''))
+            and invocation_id(details.get('watchdog_invocation')) and invocation_id(details.get('supervisor_invocation'))):
+            return {'status': 'INSTALLED', 'merge': details['merge']}
         retry_file = ledger.root/'retry_schedule.json'
         try:
             retry = json.loads(retry_file.read_text())
         except (OSError, ValueError):
             retry = {}
-        if retry.get('next_due_at', 0) > time.time():
+        if not resume_merge_protection and retry.get('next_due_at', 0) > time.time():
             return {'status': 'COOLDOWN', 'next_due_at': retry['next_due_at']}
         try:
-            result = upgrade(repo, ledger=ledger)
+            if resume_merge_protection:
+                result = resume_protected_merge(repo, ledger, resume_merge_protection)
+                ledger.confirm_protected_merge_resume(resume_merge_protection)
+                retry_file.unlink(missing_ok=True)
+            else:
+                result = upgrade(repo, ledger=ledger)
             if result.get('status') == 'UPGRADED':
                 activated = enable_automation(Path(repo), merge=result['merge'], home=ledger.home, units=units)
-                if not activated.get('host_verified') or activated.get('commit') != result['merge']:
+                executions = activated.get('executions') or {}
+                watchdog = invocation_id(executions.get('gojob-runner-rescue'))
+                supervisor = invocation_id(executions.get('gojob-runner-supervisor'))
+                if not activated.get('host_verified') or activated.get('commit') != result['merge'] or not watchdog or not supervisor:
                     raise RuntimeError('Ativação sem validação efetiva do host e SHA integrado')
-                ledger.emit('INSTALLED', 'release_cycle_finished', merge=result['merge'])
+                ledger.emit('INSTALLED', 'release_cycle_finished', merge=result['merge'],
+                            watchdog_invocation=watchdog, supervisor_invocation=supervisor)
                 retry_file.unlink(missing_ok=True)
                 return {**result, 'status': 'INSTALLED'}
             return result
@@ -74,7 +89,7 @@ def once(repo, *, ledger=None, units=None):
         except Exception as exc:
             current = ledger.status()
             if current.get('state') == 'NEEDS_USER':
-                return {'status': 'NEEDS_USER', 'reason': current.get('details', {})}
+                return {'status': 'NEEDS_USER', 'reason': scrub(exc) if resume_merge_protection else current.get('details', {})}
             message = scrub(exc)[-1300:]
             signature = hashlib.sha256(message.encode()).hexdigest()
             attempts = retry.get('attempts', 0)+1 if retry.get('signature') == signature else 1
@@ -85,7 +100,7 @@ def once(repo, *, ledger=None, units=None):
             atomic_json(retry_file, {'signature': signature, 'attempts': attempts,
                                      'next_due_at': time.time()+delay, 'last_error': message})
             if not transient and state!='NEEDS_USER' and attempts==1 and current.get('event') not in (
-                'no_authorized_code_repair', 'agent_transport_failed', 'triage_pending'
+                'no_authorized_code_repair', 'agent_transport_failed', 'triage_pending', 'ci_repair_gate_failure'
             ):
                 from release_agent_recovery import diagnose_controller_failure
 
@@ -102,7 +117,10 @@ def once(repo, *, ledger=None, units=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True)
-    parser.add_argument('--status', action='store_true')
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--status', action='store_true')
+    action.add_argument('--resume-merge-protection', metavar='HEAD',
+                        help='Autoriza revalidar proteção e retomar somente a intenção de merge para este SHA')
     parser.add_argument('--home', type=Path)
     parser.add_argument('--units', type=Path)
     options = parser.parse_args(argv)
@@ -112,7 +130,8 @@ def main(argv=None):
     else:
         if (ROOT/'manifest.json').exists() or OID.fullmatch(ROOT.name):
             verify_package(ROOT)
-        result = once(options.repo, ledger=ledger, units=options.units)
+        result = once(options.repo, ledger=ledger, units=options.units,
+                      resume_merge_protection=options.resume_merge_protection)
     print('[GOJOB RELEASE RECOVERY] '+json.dumps(result, ensure_ascii=False), flush=True)
 
 

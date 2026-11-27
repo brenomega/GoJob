@@ -134,6 +134,71 @@ class IncidentRecovery(unittest.TestCase):
             self.assertTrue(any((self.home/'incidents').glob('*/context.json')) is False) # mocked diagnostic
             self.assertTrue(any((self.home/'incidents').glob('*/watchdog_action.json')))
 
+    def test_watchdog_shares_failed_supervisor_invocation_and_budget(self):
+        from types import SimpleNamespace
+
+        identity='a'*32
+        result=SimpleNamespace(returncode=70,stdout='',stderr='runner crashed reading checkpoint')
+        diagnosis={'decision':'REPAIR_RUNNER','cause':'invalid checkpoint read','plan':'correct reader',
+                   'evidence':['reproduced failure on valid checkpoint']}
+        with (patch.dict('os.environ',{'INVOCATION_ID':identity}),
+              patch.object(s,'resume_runner',return_value=(result,'head1')),
+              patch.object(s,'supervisor_triage',return_value=(diagnosis,{})),
+              patch.object(s,'repair',side_effect=RuntimeError('synthetic transport outage')),
+              patch.object(s,'notify')):
+            self.assertEqual(s.main(['--repo',str(self.repo),'--home',str(self.home)]),70)
+        session=d.read_json(self.home/'supervisor_session.json',{})
+        original=session['incident_id']
+        status={'ActiveState':'failed','Result':'exit-code','ExecMainStatus':'70',
+                'InvocationID':identity,'ExecMainPID':str(session['pid']),
+                'ExecMainStartTimestampMonotonic':str(session['observed_at']-1),
+                'ExecMainExitTimestampMonotonic':str(session['observed_at']+1)}
+        with (patch.object(watch,'service_status',return_value=status),
+              patch.object(watch,'triage_event',return_value=(diagnosis,{})),
+              patch.object(watch,'fallback_repair',side_effect=RuntimeError('synthetic outage')) as repair):
+            shared=watch.check(self.repo,self.home)
+            self.assertEqual(shared['status'],'REPAIR_COOLDOWN_OR_EXHAUSTED')
+            self.assertEqual(shared['incident'],original)
+            repair.assert_not_called()
+            status['InvocationID']='b'*32
+            new=watch.check(self.repo,self.home)
+        self.assertNotEqual(new['incident'],original)
+        repair.assert_called_once()
+        budget=d.read_json(self.home/'incidents'/original/'repair_attempts.json',{})
+        self.assertEqual(budget['attempts'],1)
+
+    def test_watchdog_defers_failed_intent_and_reconciles_next_after_health_check(self):
+        diagnosis={'decision':'REPAIR_RUNNER','cause':'runner bug','plan':'reconcile merge intent',
+                   'evidence':['reviewed PR retained']}
+        first,second='a'*14,'b'*14
+        for ident in (first,second):
+            folder=self.home/'incidents'/ident
+            d.save_json(folder/'incident.json',{'id':ident,'repo':str(self.repo)})
+            d.save_json(folder/'triage.json',diagnosis)
+            d.save_json(self.home/'repairs'/f'{ident}-review-history.json',{'merge_intent':{'pr':3}})
+        calls=[]
+
+        def health():
+            calls.append('health')
+            return {'ActiveState':'inactive','Result':'success'}
+
+        def repair(repo,home,ident,*_):
+            calls.append(ident)
+            if ident==first:
+                raise RuntimeError('Base avançou enquanto o PR permaneceu aberto')
+            return {'merge':'confirmed'}
+
+        with (patch.object(watch,'service_status',side_effect=health),
+              patch.object(watch,'fallback_repair',side_effect=repair),
+              patch.object(d,'promote_approved_supervisor',return_value={'status':'DEPLOYED'})):
+            self.assertEqual(watch.check(self.repo,self.home)['status'],'REPAIRED')
+            self.assertEqual(watch.check(self.repo,self.home)['status'],'HEALTHY_OR_IDLE')
+        self.assertEqual(calls,['health',first,second,'health'])
+        self.assertTrue((self.home/'incidents'/second/'deployment.json').is_file())
+        retry=d.read_json(self.home/'incidents'/first/'merge-resume.json',{})
+        self.assertEqual(retry['attempts'],1)
+        self.assertIn('Base avançou',retry['last_error'])
+
     def test_independent_supervisor_exit_76_is_diagnosed_not_blindly_ignored(self):
         from types import SimpleNamespace
         failed=SimpleNamespace(returncode=76,stdout='',stderr='Codex unavailable')

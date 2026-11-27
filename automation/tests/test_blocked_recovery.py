@@ -76,6 +76,43 @@ class BlockedRecovery(unittest.TestCase):
                            branch=self.branch,reason='Developer relatou bloqueio real',
                            report={'status':'BLOCKED','limitations':['Fonte privada não encontrada']})
     def tearDown(self):self.tmp.cleanup()
+
+    def test_interrupted_test_diff_returns_only_to_test_engineer(self):
+        path='tests/test_synthetic_contract.py'
+        (self.work/'synthetic_product.py').write_text('FIXTURE_VALUE = 1\n')
+        git(self.work,'add','synthetic_product.py')
+        git(self.work,'commit','-m','feat(fixture): simule código da tarefa [#0.1.2]')
+        head=git(self.work,'rev-parse','HEAD')
+        (self.work/path).write_text('# teste iniciado pelo Test Engineer\n')
+        self.runner.record('0.1.2','TEST_ENGINEER_START',stage='TEST_IN_PROGRESS',issue=4,test_source_head=head)
+        calls=[]
+
+        def test_agent(role, prompt, *_args, **kwargs):
+            calls.append(role)
+            self.assertEqual(role,'independent-test-engineer')
+            self.assertTrue(kwargs['write'])
+            self.assertEqual(self.runner.entry('0.1.2')['test_source_head'],head)
+            self.assertIn('teste iniciado',(self.work/path).read_text())
+            (self.work/path).write_text('# teste concluído pelo Test Engineer\n')
+            return {'status':'DONE','commit_plan':[
+                {'message':'test(fixture): conclua cenário sintético [#0.1.2]','paths':[path]}]}
+
+        with patch.object(self.runner,'_agent',side_effect=test_agent), \
+             patch.object(self.runner,'_verify',side_effect=InterruptedError('gates depois dos testes')):
+            (self.work/'synthetic_product.py').write_text('FIXTURE_VALUE = 2\n')
+            with self.assertRaisesRegex(PolicyFailure,'Diff de testes interrompido'):
+                self.runner.run_one(self.task)
+            self.assertEqual((self.work/'synthetic_product.py').read_text(),'FIXTURE_VALUE = 2\n')
+            self.assertEqual(self.runner.entry('0.1.2')['stage'],'TEST_IN_PROGRESS')
+            (self.work/'synthetic_product.py').write_text('FIXTURE_VALUE = 1\n')
+            self.assertEqual(calls,[])
+            with self.assertRaisesRegex(InterruptedError,'gates depois dos testes'):
+                self.runner.run_one(self.task)
+        self.assertEqual(calls,['independent-test-engineer'])
+        completed=git(self.work,'rev-parse','HEAD')
+        self.assertEqual(git(self.work,'rev-parse','HEAD^'),head)
+        self.assertEqual(git(self.work,'diff','--name-only',head,completed),path)
+        self.assertEqual(self.runner.entry('0.1.2')['stage'],'TESTED')
     def test_developer_blocked_delegates_to_different_session_with_context(self):
         report=self.runner._blocked_resolution(self.task)
         self.assertEqual(report['state'],'RECOVERED')

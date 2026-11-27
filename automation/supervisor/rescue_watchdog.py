@@ -7,7 +7,7 @@ A verified older supervisor is used only as a fallback repair engine, never
 for rewriting product state or bypassing policy.
 """
 from __future__ import annotations
-import argparse,fcntl,json,os,subprocess,sys,time
+import argparse,fcntl,json,os,re,subprocess,sys,time
 from pathlib import Path
 
 if __name__ == '__main__':
@@ -17,8 +17,10 @@ from gojob_runner.agent_privacy import agent_env
 from schema_protocol import prepared_schema
 from recovery_context import redact
 from recovery_dispatch import read_json,triage_event,save_json,incident_key,run_incident_repair,resume_pending_repairs
+from service_execution import matches_execution, report_completion
 
 MODEL='gpt-6.2-sol'
+SOURCE_ROOT=Path(__file__).resolve().parents[2]
 
 def agent(repo,prompt,schema,write):
     import tempfile
@@ -41,7 +43,8 @@ def agent(repo,prompt,schema,write):
 def service_status():
     try:
         p=subprocess.run(['systemctl','--user','show','gojob-runner-supervisor.service',
-            '-p','ActiveState','-p','SubState','-p','Result','-p','ExecMainStatus','-p','MainPID'],
+            '-p','ActiveState','-p','SubState','-p','Result','-p','ExecMainStatus','-p','ExecMainPID',
+            '-p','InvocationID','-p','ExecMainStartTimestampMonotonic','-p','ExecMainExitTimestampMonotonic'],
             capture_output=True,text=True,timeout=8)
         if p.returncode:return {'unavailable':redact(p.stderr)[:200]}
         return dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
@@ -89,10 +92,8 @@ def check(repo,home,*,force=False,now=None):
     now=time.time() if now is None else now
     def repair(repo,home,ident,evidence):
         return fallback_repair(repo,home,ident,evidence,home/'stable')
-    resumed=resume_pending_repairs(repo,home,repair)
-    if resumed is not None:
-        return resumed
     status=service_status()
+    resumed=resume_pending_repairs(repo,home,repair)
     active=status.get('ActiveState')
     result=status.get('Result')
     session=read_json(home/'supervisor_session.json',{})
@@ -101,18 +102,28 @@ def check(repo,home,*,force=False,now=None):
     failed=(active=='failed' or (active not in ('active','activating')
                                and result not in (None,'','success')))
     stale=(session.get('phase')=='RUNNING' and now-session.get('started_at',now)>9*3600 and active not in ('active','activating'))
-    if not (failed or stale or force):return {'status':'HEALTHY_OR_IDLE','service':status}
+    if not (failed or stale or force):return resumed or {'status':'HEALTHY_OR_IDLE','service':status}
+    shared=session.get('incident_id')
+    recorded=(session.get('repo')==str(repo) and re.fullmatch(r'[0-9a-f]{14}',shared or '')
+              and matches_execution(session,status))
     failure = {'Result': result, 'ExecMainStatus': status.get('ExecMainStatus')}
     info_text='Supervisor unexpected stop: '+json.dumps(failure,sort_keys=True)
-    fingerprint=incident_key(repo,'watchdog_supervisor_crash',info_text)
+    fingerprint=shared if recorded else incident_key(repo,'watchdog_supervisor_crash',info_text)
     folder=home/'incidents'/fingerprint
     prior=read_json(folder/'incident.json',{})
-    info={'id':fingerprint,'repo':str(repo),'kind':'watchdog_supervisor_crash',
-          'error':redact(info_text)[:2100],'time':now,'first_seen':prior.get('first_seen',now),
-          'occurrences':int(prior.get('occurrences',0))+1}
-    save_json(folder/'incident.json',info)
+    if recorded and prior.get('id')==fingerprint and prior.get('repo')==str(repo):
+        info=prior
+    else:
+        fingerprint=incident_key(repo,'watchdog_supervisor_crash',info_text)
+        folder=home/'incidents'/fingerprint
+        prior=read_json(folder/'incident.json',{})
+        info={'id':fingerprint,'repo':str(repo),'kind':'watchdog_supervisor_crash',
+              'error':redact(info_text)[:2100],'time':now,'first_seen':prior.get('first_seen',now),
+              'occurrences':int(prior.get('occurrences',0))+1}
+        save_json(folder/'incident.json',info)
     diagnosis,evidence=triage_event(repo,home,folder,info,agent_func=agent,
-                                     source='independent_watchdog',exit_code=status.get('ExecMainStatus'))
+                                     source='independent_watchdog',runner_sha=info.get('runner_sha'),
+                                     exit_code=status.get('ExecMainStatus'))
     outcome=run_incident_repair(repo,home,folder,info,diagnosis,repair)
     outcome['incident']=fingerprint
     save_json(folder/'watchdog_action.json',outcome)
@@ -130,6 +141,7 @@ def main(argv=None):
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return 0
         check(a.repo,home,force=a.force)
+        report_completion(home,'gojob-runner-rescue',SOURCE_ROOT)
     return 0
 
 if __name__=='__main__':sys.exit(main())

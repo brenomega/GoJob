@@ -15,11 +15,14 @@ if __name__ == '__main__':
 
 from gojob_runner.agent_privacy import redact
 from gojob_runner.merge_evidence import verify_ci
-from gojob_runner.review_policy import MAX_REVIEW_ROUNDS, collect_reviews, disposition, review_feedback
-from gojob_runner.tools import GitHub, apply_commit_plan, command, git, validate_path, worktree_changes
+from gojob_runner.review_policy import HUMAN_KINDS, MAX_REVIEW_ROUNDS, collect_reviews, disposition, review_feedback
+from gojob_runner.tools import (
+    ExternalFailure, GitHub, TransientFailure, VerifiedCIFailure, command, git, validate_path, worktree_changes,
+)
 from release_agent_recovery import call_codex, recover_implementer
+from release_commits import package_intent, repair_intent, resume_commits
 from release_control import ReleaseLedger, atomic_json
-from release_package import package_path, verify_package
+from release_package import package_path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = (ROOT/'RUNNER_VERSION').read_text().strip()
@@ -88,23 +91,33 @@ def prior_candidate(repo):
 
 def implement(repo, row, ledger):
     head, base, number = row['head'], row['base'], row['round']
+    ci_failure = row.get('ci_failure')
+    name = f'{number}-{head}' if not ci_failure else f"ci-{row['pr']}-{base}-{head}"
+    journal = ledger.root/'implementation'/f'{name}.json'
+    attempt = load(journal, {})
+    remaining = 8 - int(git(repo, 'rev-list', '--count', f'{base}..{head}'))
+    scope = {'allowed_prefixes': SOURCE_PREFIXES, 'allowed_files': REPAIR_FILES, 'max_commits': remaining}
+    if attempt.get('commit_intent'):
+        corrected = resume_commits(repo, EAP, attempt['commit_intent'], **scope)
+        if not ci_failure:
+            gates(repo)
+        return corrected
     staged, dirty = worktree_changes(repo)
-    if staged or any(not release_scope(path) for path in dirty):
-        raise ValueError('Índice ou diff fora do escopo do reparo; preservar worktree')
+    if (staged or git(repo, 'rev-parse', 'HEAD') != head
+        or any(not release_scope(path) for path in dirty)):
+        raise ValueError('HEAD, índice ou diff fora do escopo do reparo; preservar worktree')
     for path in dirty:
         validate_path(repo, path)
-    remaining = 8 - int(git(repo, 'rev-list', '--count', f'{base}..HEAD'))
     if remaining < 1:
         ledger.emit('NEEDS_USER', 'commit_budget_exhausted', head=head, base=base)
         raise ValueError('Limite de commits da release atingido')
     schema = repo/'automation/gojob_runner/schemas/developer.json'
-    feedback = review_feedback(row['strategic'], row['technical'])
+    feedback = (row.get('previous_reviews', {}) if ci_failure else
+                review_feedback(row['strategic'], row['technical']))
     # A crash or a failed transport consumes the primary call for this round.
     # Subsequent passes use the independent recovery budget.
-    journal = ledger.root/'implementation'/f'{number}-{head}.json'
-    attempt = load(journal, {})
     report = attempt.get('report')
-    if not attempt:
+    if not attempt and not ci_failure:
         atomic_json(journal, {'state': 'STARTED'})
         prompt = (
             f'PAPEL INDEPENDENT RELEASE IMPLEMENTER. EAP #{EAP}, HEAD {head}, BASE {base}. '
@@ -125,29 +138,116 @@ def implement(repo, row, ledger):
         atomic_json(journal, {'state': 'REPORTED', 'report': saved})
     if not report or report.get('status') != 'DONE':
         report = recover_implementer(repo, base, head, feedback, report, schema=schema,
-                                     ledger=ledger, eap=EAP, round_number=number)
-    # Store only the fields needed to replay the verified commit plan after interruption.
-    report = {'status': report['status'], 'commit_plan': report.get('commit_plan')}
-    atomic_json(journal, {'state': 'REPORTED', 'report': report})
-    if any(not release_scope(path) for path in worktree_changes(repo)[1]):
-        raise ValueError('Implementador editou fora do escopo de release')
-    apply_commit_plan(repo, EAP, report, allowed_prefixes=SOURCE_PREFIXES, allowed_files=REPAIR_FILES, max_commits=remaining)
-    gates(repo)
+                                     ledger=ledger, eap=EAP, round_number=number, ci_failure=ci_failure,
+                                     remaining_commits=remaining)
+        report = {'status': report['status'], 'commit_plan': report.get('commit_plan')}
+        atomic_json(journal, {'state': 'REPORTED', 'report': report})
+    intent = repair_intent(repo, head, EAP, report, **scope)
+    if ci_failure:
+        try:
+            gates(repo)
+        except TransientFailure:
+            raise
+        except ExternalFailure as exc:
+            atomic_json(journal, {'state': 'REPORTED', 'report': {'status': 'BLOCKED', 'summary': redact(exc)}})
+            ledger.emit('REPAIRING', 'ci_repair_gate_failure', head=head, base=base, cause=exc)
+            raise
+    atomic_json(journal, {'state': 'COMMITTING', 'commit_intent': intent})
+    corrected = resume_commits(repo, EAP, intent, **scope)
+    if not ci_failure:
+        gates(repo)
+    return corrected
+
+
+def resume_correction(repo, scm, pr, base, state, path, ledger, *, recheck_ci=False):
+    row = state['active_correction']
+    if (row['pr'], row['base']) != (pr, base):
+        raise ValueError('Correção pendente pertence a outro PR ou BASE')
+    if 'to' not in row:
+        scm.snapshot(pr, BRANCH, row['head'], base)
+        if (recheck_ci and row.get('ci_failure') and git(repo, 'rev-parse', 'HEAD') == row['head']
+            and not any(worktree_changes(repo))):
+            try:
+                scm.checks(pr, row['head'], base, BRANCH)
+            except VerifiedCIFailure:
+                pass
+            else:
+                state.setdefault('superseded_ci_failures', []).append(state.pop('active_correction'))
+                atomic_json(path, state)
+                return
+        corrected = implement(repo, row, ledger)
+        verify_candidate_scope(repo, row['head'], corrected, release_scope)
+        row['to'] = corrected
+        atomic_json(path, state)
+    elif git(repo, 'rev-parse', 'HEAD') != row['to'] or any(worktree_changes(repo)):
+        raise ValueError('Worktree diverge da correção pronta para publicação; preservar')
+    git(repo, 'push', 'origin', BRANCH, timeout=240)
+    state.setdefault('corrections', []).append(state.pop('active_correction'))
+    pending = state.get('pending') or {}
+    if (pending.get('pr'), pending.get('head'), pending.get('base')) == (pr, row['head'], base):
+        state.setdefault('superseded_reviews', []).append(state.pop('pending'))
+    atomic_json(path, state)
+
+
+def check_review_veto(row, head, base, pr, ledger):
+    if not row:
+        return
+    for role in ('strategic', 'technical'):
+        report = row.get(role)
+        if report and report.get('blocking_kind') in HUMAN_KINDS:
+            validate_review(report, role, head, base)
+            ledger.emit('NEEDS_USER', 'release_review_blocked', pr=pr, head=head, base=base,
+                        reason=report.get('rationale'))
+            raise ValueError('Parecer exige decisão humana ou resolução externa')
+
+
+def verify_reviewed_transition(repo, state, last, head, base, pr):
+    old = last['head']
+    verdict = validate_reviews(last, old, base, pr)
+    corrected = old
+    for row in state.get('corrections', []):
+        if (row['pr'], row['base'], row['head']) == (pr, base, corrected):
+            corrected = row['to']
+    # Older journals can contain an already-published correction without a
+    # commit intent. New intents must account for the entire transition.
+    authorized = verdict.action == 'REPAIR' if corrected == old else corrected == head
+    if (verdict.action == 'NEEDS_USER' or not authorized
+        or git(repo, 'merge-base', old, head) != old):
+        raise ValueError('HEAD divergente de um reparo autorizado')
+    verify_candidate_scope(repo, old, head, release_scope)
 
 
 def review_release(repo, scm, pr, base, state, path, ledger):
     while True:
+        if state.get('active_correction'):
+            resume_correction(repo, scm, pr, base, state, path, ledger)
         head = git(repo, 'rev-parse', 'HEAD')
         last = state['rounds'][-1] if state['rounds'] else None
         if last and last['head'] != head:
-            old = last['head']
-            if (validate_reviews(last, old, base, pr).action != 'REPAIR'
-                or git(repo, 'merge-base', old, head) != old):
-                raise ValueError('HEAD divergente de um reparo autorizado')
-            verify_candidate_scope(repo, old, head, release_scope)
-            last['repair'] = {'from': old, 'to': head}
+            verify_reviewed_transition(repo, state, last, head, base, pr)
+            last['repair'] = {'from': last['head'], 'to': head}
             atomic_json(path, state)
-        scm.checks(pr, head, base, BRANCH)
+        if last and last['head'] == head:
+            verdict = validate_reviews(last, head, base, pr)
+            if verdict.action == 'NEEDS_USER':
+                ledger.emit('NEEDS_USER', 'release_review_blocked', pr=pr, head=head, base=base, reason=verdict.reason)
+                raise ValueError(verdict.reason)
+        pending = state.get('pending') or {}
+        if (pending.get('pr'), pending.get('head'), pending.get('base')) == (pr, head, base):
+            check_review_veto(pending, head, base, pr, ledger)
+        try:
+            scm.checks(pr, head, base, BRANCH)
+        except VerifiedCIFailure as failure:
+            if len(state['rounds']) >= MAX_REVIEW_ROUNDS:
+                ledger.emit('NEEDS_USER', 'review_budget_exhausted', pr=pr, head=head, base=base)
+                raise
+            if any(worktree_changes(repo)):
+                raise ValueError('CI falhou com diff local fora de uma correção registrada; preservar') from failure
+            state['active_correction'] = {'pr': pr, 'head': head, 'base': base, 'round': len(state['rounds'])+1,
+                                          'ci_failure': failure.evidence,
+                                          'previous_reviews': review_feedback(last['strategic'], last['technical']) if last else {}}
+            atomic_json(path, state)
+            continue
         if last and last['head'] == head:
             row = last
         else:
@@ -194,9 +294,8 @@ def review_release(repo, scm, pr, base, state, path, ledger):
             if any(worktree_changes(repo)):
                 raise ValueError('Worktree contém alterações após aprovação')
             return head
-        implement(repo, row, ledger)
-        verify_candidate_scope(repo, head, git(repo, 'rev-parse', 'HEAD'), release_scope)
-        git(repo, 'push', 'origin', BRANCH, timeout=240)
+        state['active_correction'] = {**row, 'pr': pr}
+        atomic_json(path, state)
 
 
 def issue_number(scm):
@@ -211,7 +310,7 @@ def issue_number(scm):
     return int(match[1])
 
 
-def finish_merge(scm, state, path):
+def finish_merge(scm, state, path, *, revalidate_protection=False):
     intent = state['merge_intent']
     pr, head, base = (intent[field] for field in ('pr', 'head', 'base'))
     if (validate_reviews(state['rounds'][-1], head, base, pr).action != 'ACCEPT'
@@ -220,6 +319,8 @@ def finish_merge(scm, state, path):
     remote = scm.pr(pr)
     if not state.get('merge_confirmed') and remote.get('state') == 'OPEN':
         remote = scm.merge(pr, BRANCH, head, base)
+    elif revalidate_protection:
+        scm.require_merge_protection(intent['ci'])
     merge = scm.confirm_merge(remote, BRANCH, head, base)
     if git(scm.repo, 'show', f'{merge}:RUNNER_VERSION').strip() != VERSION:
         raise ValueError('Versão do merge difere da release')
@@ -240,7 +341,11 @@ def upgrade_once(repo, ledger):
     if state.get('version') != VERSION:
         raise ValueError('Journal pertence a outra versão')
     if state.get('merge_intent'):
-        return finish_merge(scm, state, journal)
+        try:
+            return finish_merge(scm, state, journal)
+        except VerifiedCIFailure:
+            state.setdefault('superseded_merge_intents', []).append(state.pop('merge_intent'))
+            atomic_json(journal, state)
     existing = scm.get_pr(BRANCH)
     if existing and existing['state'] == 'MERGED':
         # Reconcile a release approved by the previous host controller, which
@@ -262,6 +367,8 @@ def upgrade_once(repo, ledger):
         return finish_merge(scm, state, journal)
     if existing and existing['state'] != 'OPEN':
         raise ValueError('PR anterior fechado; preservar para reconciliação')
+    if existing and state.get('pr', existing['number']) != existing['number']:
+        raise ValueError('PR diverge do journal de release')
     git(repo, 'fetch', 'origin', 'develop')
     base = git(repo, 'rev-parse', 'origin/develop')
     if state.get('base', base) != base:
@@ -279,38 +386,30 @@ def upgrade_once(repo, ledger):
             git(repo, 'worktree', 'add', '-b', BRANCH, str(folder), base)
     if git(folder, 'branch', '--show-current') != BRANCH or git(folder, 'merge-base', 'HEAD', base) != base:
         raise ValueError('Identidade da worktree diverge da release')
-    staged, dirty = worktree_changes(folder)
     last = state['rounds'][-1] if state['rounds'] else None
     head = git(folder, 'rev-parse', 'HEAD')
+    if not existing and (head == base or state.get('preparation')):
+        if 'preparation' not in state:
+            state['preparation'] = package_intent(folder, base, ROOT, EAP)
+            atomic_json(journal, state)
+        if state['preparation']['source'] != base:
+            raise ValueError('Preparação pertence a outra BASE')
+        head = resume_commits(folder, EAP, state['preparation'], package=ROOT)
+    if state.get('active_correction'):
+        if not existing:
+            raise ValueError('Correção pendente sem PR correspondente')
+        resume_correction(folder, GitHub(folder), existing['number'], base, state, journal, ledger, recheck_ci=True)
+        head = git(folder, 'rev-parse', 'HEAD')
+    staged, dirty = worktree_changes(folder)
     if staged or (dirty and (not last or not existing or head != last['head']
                   or validate_reviews(last, head, base, existing['number']).action != 'REPAIR')):
         raise ValueError('Worktree suja fora de um reparo conhecido; preservar')
-    if head == base and not existing:
-        manifest = verify_package(ROOT)
-        changes = []
-        for path in sorted(manifest['files']):
-            target = folder/path
-            content = (ROOT/path).read_bytes()
-            if not target.exists() or target.read_bytes() != content:
-                if not package_path(path):
-                    raise ValueError('Conteúdo fora da distribuição do runner')
-                validate_path(folder, path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-                changes.append(path)
-        groups = [[path for path in changes if path.startswith(prefix)] for prefix in SOURCE_PREFIXES]
-        groups.append(sorted(set(changes)-set().union(*groups)))
-        plan = [{'message': f'chore(runner): publique arquivos da release [#{EAP}]', 'paths': group}
-                for group in groups if group]
-        apply_commit_plan(folder, EAP, {'status': 'DONE', 'commit_plan': plan})
-        head = git(folder, 'rev-parse', 'HEAD')
     verify_candidate_scope(folder, base, head, package_path)
     if last and last['head'] != head:
-        if (validate_reviews(last, last['head'], base, existing['number']).action != 'REPAIR'
-            or git(folder, 'merge-base', last['head'], head) != last['head']):
-            raise ValueError('HEAD local não corresponde ao reparo autorizado')
-        verify_candidate_scope(folder, last['head'], head, release_scope)
-    if not dirty:
+        if not existing:
+            raise ValueError('Parecer anterior sem PR correspondente')
+        verify_reviewed_transition(folder, state, last, head, base, existing['number'])
+    if not existing and not dirty:
         gates(folder)
     issue = issue_number(scm)
     git(folder, 'push', '-u', 'origin', BRANCH, timeout=240)
@@ -328,6 +427,7 @@ def upgrade_once(repo, ledger):
     state['pr'] = pr
     atomic_json(journal, state)
     head = review_release(folder, GitHub(folder), pr, base, state, journal, ledger)
+    gates(folder)
     proof = GitHub(folder).checks(pr, head, base, BRANCH)
     state['merge_intent'] = {'issue': issue, 'pr': pr, 'head': head, 'base': base, 'ci': proof}
     atomic_json(journal, state)
@@ -340,6 +440,17 @@ def upgrade(repo, *, ledger=None):
     if ledger.status().get('state') == 'NEEDS_USER':
         return {'status': 'NEEDS_USER'}
     return upgrade_once(Path(repo).resolve(), ledger)
+
+
+def resume_protected_merge(repo, ledger, head):
+    path = ledger.home/'release-worktrees'/f'{VERSION}-review-cycle.json'
+    state = load(path, {})
+    intent = state.get('merge_intent', {})
+    if state.get('version') != VERSION or intent.get('head') != head:
+        raise ValueError('SHA autorizado difere da intenção de merge da release')
+    scm = GitHub(Path(repo).resolve())
+    scm.verify_identity()
+    return finish_merge(scm, state, path, revalidate_protection=True)
 
 
 def main():

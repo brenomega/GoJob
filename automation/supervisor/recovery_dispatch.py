@@ -216,7 +216,7 @@ def proactive_review(repo,home,*,agent_func,runner_sha,minimum_interval=86400):
                                     'status':'UNAVAILABLE','error':redact(e)[:500]})
         return {'status':'UNAVAILABLE','reason':redact(e)[:350]}
 
-def promote_approved_supervisor(repo,home,expected_merge):
+def promote_approved_supervisor(repo,home,expected_merge,*,before_activate=None):
     """Activate one complete, canary-checked generation from the approved merge."""
     expected=expected_merge.get('oid') if isinstance(expected_merge,dict) else expected_merge
     if not isinstance(expected,str) or not OID.fullmatch(expected):
@@ -233,6 +233,8 @@ def promote_approved_supervisor(repo,home,expected_merge):
             if git_bytes(repo,'merge-base',expected,current).decode().strip()==expected:
                 raise ValueError('Geração ativa descende do merge solicitado; preservar instalação mais recente')
     package=build_package(repo,expected,Path(home)/'supervisor-generations')
+    if before_activate:
+        before_activate()
     changed=activate_package(home,package)
     return {'status':'DEPLOYED' if changed else 'ALREADY_CURRENT',
             'version':(package/'RUNNER_VERSION').read_text().strip(),'commit':expected,
@@ -265,12 +267,20 @@ def run_incident_repair(repo, home, folder, info, diagnosis, repair, *, claim=No
                 return {'status':'NEEDS_USER','incident':info['id'],
                         'reason':'Reconciliar aprovação anterior com journal e prova de merge'}
         resuming=bool(approval or pending.get('merge_intent'))
+        schedule=folder/'merge-resume.json'
+        retry=read_json(schedule,{}) if resuming else {}
+        if resuming and retry.get('next_attempt_at',0)>time.time():
+            return {'status':'MERGE_RESUME_COOLDOWN','incident':info['id']}
         if not resuming and not repair_allowed(folder):
             return {'status':'REPAIR_COOLDOWN_OR_EXHAUSTED','incident':info['id']}
         if claim is not None and not claim():
             return {'status':'DIAGNOSED_REPAIR_LIMIT_REACHED','incident':info['id']}
         if not resuming and not reserve_repair_attempt(folder):
             return {'status':'REPAIR_COOLDOWN_OR_EXHAUSTED','incident':info['id']}
+        if resuming:
+            attempts=retry.get('attempts',0)+1
+            delay=min(21600,600*2**min(attempts-1,6))
+            save_json(schedule,{'attempts':attempts,'next_attempt_at':time.time()+delay})
         try:
             if approval is None:
                 approval=repair(repo,home,info['id'],info)
@@ -279,9 +289,12 @@ def run_incident_repair(repo, home, folder, info, diagnosis, repair, *, claim=No
             save_json(folder/'deployment.json',deployed)
             record_repair_attempt(folder,'SUCCEEDED')
             (folder/'repair.failed').unlink(missing_ok=True)
+            schedule.unlink(missing_ok=True)
             return {'status':'REPAIRED','result':approval,'deployment':deployed,'attempted':True}
         except Exception as exc:
             error=redact(type(exc).__name__+': '+str(exc))
+            if resuming:
+                save_json(schedule,{**read_json(schedule,{}),'last_error':error[:800]})
             record_repair_attempt(folder,'FAILED',error)
             private_write(folder/'repair.failed',error)
             return {'status':'REPAIR_FAILED','error':error[:500],'incident':info['id'],'attempted':True}
@@ -291,6 +304,7 @@ def resume_pending_repairs(repo,home,repair):
     """Reconcile remote operations even after the condition that triggered them disappears."""
     repo=Path(repo).resolve()
     home=Path(home)
+    failure=None
     for folder in sorted((home/'incidents').glob('*/')):
         if (folder/'deployment.json').exists():
             continue
@@ -303,5 +317,9 @@ def resume_pending_repairs(repo,home,repair):
             continue
         diagnosis=read_json(folder/'triage.json',{})
         if repair_authorized(diagnosis):
-            return run_incident_repair(repo,home,folder,info,diagnosis,repair)
-    return None
+            result=run_incident_repair(repo,home,folder,info,diagnosis,repair)
+            if result['status']=='REPAIR_FAILED':
+                failure=result
+            elif result['status'] in ('REPAIRED','REPAIR_BUSY'):
+                return result
+    return failure

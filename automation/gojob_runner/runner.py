@@ -18,6 +18,7 @@ from .tools import (GitHub,git,command,assert_clean,commit_audit,verify_product,
                     product_code_changes,is_product_test_path)
 
 SCHEMAS=Path(__file__).resolve().parent/'schemas'
+TEST_STAGES=('TEST_IN_PROGRESS','TEST_RECOVERY')
 
 class Runner:
     def __init__(self,repo,state_root=None,codex=None,scm=None):
@@ -115,12 +116,14 @@ class Runner:
         tid=task['id']
         head=git(work,'rev-parse','HEAD')
         saved=self.entry(tid)
-        if saved.get('test_source_head')==head and saved.get('test_head')==head:
-            return
         staged,dirty=worktree_changes(work)
         if staged:raise PolicyFailure('Índice staged antes do Test Engineer; preservar para diagnóstico')
-        if dirty and saved.get('stage') not in ('TEST_IN_PROGRESS','TEST_RECOVERY'):
-            raise PolicyFailure('Arquivos sujos fora da etapa de testes; preservar para diagnóstico')
+        if dirty:
+            if (saved.get('stage') not in TEST_STAGES
+                or saved.get('test_source_head')!=head or not all(map(self._product_test_path,dirty))):
+                raise PolicyFailure('Diff de testes interrompido diverge do papel ou do HEAD; preservar para diagnóstico')
+        elif saved.get('test_source_head')==head and saved.get('test_head')==head:
+            return
         self.record(tid,'TEST_ENGINEER_START',stage='TEST_IN_PROGRESS',test_source_head=head)
         prompt=self._prompt('INDEPENDENT TEST ENGINEER',task,work,base,
             'Você, e NÃO o runner, é responsável por conceber e implementar testes DO PRODUTO. '
@@ -131,6 +134,7 @@ class Runner:
             'contratos, versão ou governança. Não execute git write; devolva commit_plan exato. '
             'Se os testes existentes já detectam os riscos desta mudança, NÃO crie casos redundantes; '
             'explique quais testes, quais oráculos, quais falhas plausíveis e por que não houve diffs. '
+            'Se houver edições de testes interrompidas, inspecione o diff, preserve o trabalho e conclua o plano. '
             f'HEAD do produto: {head}. Fontes alteradas: {sources}. '
             'Todo resultado de integração não testado deve aparecer como limitação, nunca PASS.')
         report=self._agent('independent-test-engineer',prompt,work,'test_engineer.json',write=True)
@@ -138,8 +142,7 @@ class Runner:
             self.record(tid,'TEST_ENGINEER_BLOCK',stage='BLOCKED',test_report=report)
             raise PolicyFailure('Test Engineer bloqueou: revisão/especificação necessária')
         changed=worktree_changes(work)[1]
-        forbidden=[name for name in changed if (not is_product_test_path(name) or
-                   name=='tests/test_bootstrap.py' or name.startswith('automation/'))]
+        forbidden=[name for name in changed if not self._product_test_path(name)]
         if forbidden:
             raise PolicyFailure('Test Engineer alterou fora dos caminhos de teste: '+str(forbidden[:8]))
         if changed:
@@ -154,6 +157,10 @@ class Runner:
         completed=git(work,'rev-parse','HEAD')
         self.record(tid,'TEST_ENGINEER_COMPLETE',stage='TESTED',test_source_head=completed,
                     test_head=completed,test_report=report)
+
+    @staticmethod
+    def _product_test_path(path):
+        return is_product_test_path(path) and path!='tests/test_bootstrap.py' and not path.startswith('automation/')
 
     def _validate_review(self,report,head,base,decision_key):
         if report.get('head_sha')!=head or report.get('base_sha')!=base:
@@ -430,17 +437,27 @@ class Runner:
         with self.lock:
             git(self.repo,'fetch','origin','develop',timeout=240)
         issue=saved.get('issue') or self.scm.issue(task)
-        self.record(tid,'ISSUE_CONFIRMED',issue=issue,branch=branch,stage='ISSUE')
+        testing=saved.get('stage') in TEST_STAGES
+        self.record(tid,'ISSUE_CONFIRMED',issue=issue,branch=branch,stage=saved['stage'] if testing else 'ISSUE')
         work=self.worktree(task,branch)
         base=git(work,'merge-base','HEAD','origin/develop')
         original=saved.get('base')
         if original and original!=base:
             raise PolicyFailure('A base da tarefa mudou; replanejar sem rebase automático')
-        self.record(tid,'BASE_PINNED',stage='WORKTREE',base=base)
+        self.record(tid,'BASE_PINNED',stage=saved['stage'] if testing else 'WORKTREE',base=base)
         commits=git(work,'rev-list','--count',f'{base}..HEAD')
         staged,dirty=worktree_changes(work)
         if staged:
             raise PolicyFailure('Índice staged inesperado: preservar para diagnóstico, nunca reset')
+        if dirty and testing:
+            if (task.get('type')=='runner_fix' or commits=='0'
+                or not all(map(self._product_test_path,dirty))
+                or saved.get('test_source_head')!=git(work,'rev-parse','HEAD')):
+                raise PolicyFailure('Diff de testes interrompido diverge do papel ou do HEAD; preservar para diagnóstico')
+            self._delegate_product_tests(task,work,base)
+            _,dirty=worktree_changes(work)
+            if dirty:
+                raise PolicyFailure('Diff de testes interrompido sem plano verificável; preservar para diagnóstico')
         if dirty and not (checkpoint and checkpoint['head']==git(work,'rev-parse','HEAD')):
             # After Codex timeout the model may have edited files but its final
             # JSON/commit plan was lost. Resume on exactly this worktree.
@@ -701,7 +718,10 @@ def main(argv=None):
                     except Exception as e:
                         ec=exit_code(e);code=max(code,ec)
                         prev=r.entry(task['id'])
-                        if ec==2 and prev.get('stage') not in ('NEEDS_USER',):
+                        if ec==2 and prev.get('stage') in TEST_STAGES:
+                            r.record(task['id'],'TEST_RECOVERY_RECONCILIATION',stage='NEEDS_USER',
+                                     blocked_reason=str(e)[:500],blocked_from_stage=prev['stage'])
+                        elif ec==2 and prev.get('stage')!='NEEDS_USER':
                             r.record(task['id'],'BLOCKED',stage='BLOCKED',
                                      reason=str(e)[:500],blocked_from_stage=prev.get('stage'))
                         r.journal.event('ERROR',task['id'],{'code':ec,'kind':type(e).__name__,

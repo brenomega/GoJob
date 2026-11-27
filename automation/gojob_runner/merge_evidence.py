@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from .tools import VerifiedCIFailure
 
 WORKFLOW = '.github/workflows/ci.yml'
 WORKFLOW_NAME = 'gojob-verify'
@@ -27,8 +28,9 @@ def verify_ci(api, pr, head, base):
     run = max(candidates, key=lambda row: row['id'])
     if run.get('status') != 'completed':
         return None
-    if run.get('conclusion') != 'success':
-        raise ValueError(f'{WORKFLOW_NAME} rejeitou o snapshot em CI')
+    conclusion = run.get('conclusion')
+    if conclusion not in ('success', 'failure'):
+        raise ValueError(f'{WORKFLOW_NAME} terminou com conclusão {conclusion!r}')
     rid, attempt = run['id'], run['run_attempt']
     if not isinstance(rid, int) or not isinstance(attempt, int) or attempt < 1:
         raise ValueError('Tentativa do workflow sem identidade verificável')
@@ -37,8 +39,9 @@ def verify_ci(api, pr, head, base):
     if len(matching) != 1:
         raise ValueError(f'{WORKFLOW_NAME} terminou sem um job {JOB} inequívoco')
     job = matching[0]
-    if job.get('status') != 'completed' or job.get('conclusion') != 'success':
-        raise ValueError(f'CI {JOB} não aprovou HEAD/BASE')
+    if (job.get('status') != 'completed' or job.get('conclusion') != conclusion
+        or not isinstance(job.get('id'), int)):
+        raise ValueError(f'CI {JOB} sem conclusão inequívoca para HEAD/BASE')
     url = job.get('check_run_url') or ''
     match = re.search(r'/check-runs/([0-9]+)$', url)
     if not match:
@@ -50,10 +53,15 @@ def verify_ci(api, pr, head, base):
         or (check.get('check_suite') or {}).get('id') != run['check_suite_id']
         or check.get('id') != int(match[1]) or check.get('name') != JOB
         or check.get('head_sha') != head or check.get('status') != 'completed'
-        or check.get('conclusion') != 'success'):
+        or check.get('conclusion') != conclusion):
         raise ValueError(f'Check {JOB} de origem ou SHA divergente')
-    return {'pr': pr, 'head': head, 'base': base, 'workflow': WORKFLOW,
-            'run_id': rid, 'run_attempt': attempt, 'job_id': job['id'], 'app_id': app['id']}
+    proof = {'pr': pr, 'head': head, 'base': base, 'workflow': WORKFLOW,
+             'run_id': rid, 'run_attempt': attempt, 'job_id': job['id'], 'app_id': app['id']}
+    if conclusion == 'failure':
+        proof['failed_steps'] = [step['name'] for step in job.get('steps', [])
+                                 if step.get('conclusion') == 'failure' and isinstance(step.get('name'), str)]
+        raise VerifiedCIFailure(proof)
+    return proof
 
 
 def require_strict_protection(api, proof):

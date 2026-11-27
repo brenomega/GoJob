@@ -8,15 +8,18 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 if __name__ == '__main__':
     sys.path[:0] = map(str, Path(__file__).resolve().parents[:2])
 
 from gojob_runner.merge_evidence import OID
+from gojob_runner.tools import TransientFailure
 from recovery_context import private_write
 from release_control import atomic_json
 from release_package import restore_previous, supervisor_dir, verify_package
+from service_execution import boot_id, matches_execution, monotonic_us
 
 
 def systemd_value(value):
@@ -64,7 +67,7 @@ def systemctl(*args):
                           text=True, check=True, timeout=8*3600).stdout.strip()
 
 
-def verify_units(*names, run_services=True):
+def verify_units(*names):
     for name in names:
         if systemctl('show', f'{name}.service', '--property=LoadState', '--value') != 'loaded':
             raise RuntimeError(f'Serviço {name} não carregado no host')
@@ -72,11 +75,48 @@ def verify_units(*names, run_services=True):
             raise RuntimeError(f'Timer {name} não habilitado no host')
         if systemctl('is-active', f'{name}.timer') != 'active':
             raise RuntimeError(f'Timer {name} não ativo no host')
-        if run_services:
-            systemctl('start', f'{name}.service')
-            result = systemctl('show', f'{name}.service', '--property=Result', '--value')
-            if result != 'success':
-                raise RuntimeError(f'Serviço {name} sem execução bem-sucedida no host')
+
+
+def show_service(name, *properties):
+    result = systemctl('show', f'{name}.service', *[f'--property={prop}' for prop in properties])
+    return dict(line.split('=', 1) for line in result.splitlines() if '=' in line)
+
+
+def wait_for_idle(*names, timeout=15):
+    deadline = time.monotonic() + timeout
+    while True:
+        states = [show_service(name, 'ActiveState', 'Job') for name in names]
+        if all(state.get('ActiveState') in ('inactive', 'failed') and state.get('Job', '0') in ('', '0')
+               for state in states):
+            return
+        if time.monotonic() >= deadline:
+            raise TransientFailure('timeout aguardando a execução anterior terminar em {}'.format(', '.join(names)))
+        time.sleep(1)
+
+
+def execution_proof(name, home, merge, switched_at):
+    receipt = home/'service-executions'/f'{name}.json'
+    if not receipt.is_file():
+        return None
+    status = show_service(name, 'Result', 'InvocationID', 'ExecMainPID',
+                          'ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic')
+    observed = json.loads(receipt.read_text())
+    if (status.get('Result') == 'success' and observed.get('commit') == merge
+        and matches_execution(observed, status)
+        and int(status['ExecMainStartTimestampMonotonic']) >= switched_at):
+        return observed['invocation_id']
+    return None
+
+
+def verify_execution(name, home, merge, switched_at):
+    wait_for_idle(name)
+    execution = execution_proof(name, home, merge, switched_at)
+    if execution is None:
+        systemctl('start', f'{name}.service')
+        execution = execution_proof(name, home, merge, switched_at)
+    if execution is None:
+        raise RuntimeError(f'Serviço {name} sem prova de nova execução do SHA {merge}')
+    return execution
 
 
 def install_watchdog(repo, package, home, units):
@@ -96,6 +136,8 @@ def activate(repo, merge, *, home=None, units=None, enable=True, release_timer=T
     repo = Path(repo).resolve()
     watchdog = 'gojob-runner-rescue'
     supervisor = 'gojob-runner-supervisor'
+    if enable:
+        wait_for_idle(supervisor, watchdog)
     with repair_lock(home, repo) as acquired:
         if not acquired:
             raise RuntimeError('Reparo ou promoção em andamento')
@@ -111,7 +153,16 @@ def activate(repo, merge, *, home=None, units=None, enable=True, release_timer=T
                      'units': {str(path): path.read_text() if path.is_file() else None for path in paths}}
             atomic_json(checkpoint, saved)
         backup = {Path(path): content for path, content in saved['units'].items()}
-        result = promote_approved_supervisor(repo, home, expected_merge=merge)
+        def check_idle():
+            if enable:
+                wait_for_idle(supervisor, watchdog, timeout=0)
+
+        result = promote_approved_supervisor(repo, home, expected_merge=merge, before_activate=check_idle)
+        boot = boot_id()
+        if result['status']=='DEPLOYED' or saved.get('boot_id') != boot or 'switched_at' not in saved:
+            saved.update(boot_id=boot, switched_at=monotonic_us())
+            atomic_json(checkpoint, saved)
+        executions = {}
         try:
             install_watchdog(repo, Path(result['package']), home, units)
             unit_pair(units, supervisor,
@@ -121,12 +172,18 @@ def activate(repo, merge, *, home=None, units=None, enable=True, release_timer=T
             if enable:
                 systemctl('daemon-reload')
                 if release_timer:
-                    verify_units('gojob-runner-release', run_services=False)
+                    verify_units('gojob-runner-release')
                 systemctl('enable', '--now', f'{watchdog}.timer', f'{supervisor}.timer')
                 verify_units(watchdog, supervisor)
+                for name in (watchdog, supervisor):
+                    executions[name] = verify_execution(name, home, merge, saved['switched_at'])
                 if (home/'stable').resolve() != supervisor_dir(result['package']):
                     raise RuntimeError('Geração ativa diverge do SHA integrado')
                 verify_package(result['package'])
+        except TransientFailure:
+            # A timer or OnFailure job can race with the installation. Preserve
+            # the checkpoint and let that invocation finish before trying again.
+            raise
         except Exception:
             active = home/'stable'
             if saved['active'] != str(active.resolve()):
@@ -148,7 +205,7 @@ def activate(repo, merge, *, home=None, units=None, enable=True, release_timer=T
             raise
         if enable:
             checkpoint.unlink(missing_ok=True)
-    return {**result, 'host_verified': enable}
+    return {**result, 'host_verified': enable, 'executions': executions}
 
 
 def main():

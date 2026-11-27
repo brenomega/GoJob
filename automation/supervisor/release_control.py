@@ -138,10 +138,16 @@ class ReleaseLedger:
         with self._status_lock:
             return self._emit(state,event,info)
 
-    def _emit(self,state,event,info):
+    def confirm_protected_merge_resume(self,head):
+        with self._status_lock:
+            return self._emit('MERGING','merge_protection_resume_confirmed',{'head':head}, resume_protection=True)
+
+    def _emit(self,state,event,info,*,resume_protection=False):
         if state not in STATES:raise ValueError('unknown release state '+state)
         current=self.status()
-        if current.get('state')=='NEEDS_USER':
+        if current.get('state')=='NEEDS_USER' and not (
+            resume_protection and current.get('event')=='merge_protection_required'
+        ):
             return current
         payload={'timestamp':time.time(),'version':self.version,'state':state,'event':event,
                  'details':{str(k):scrub(v)[:3000] for k,v in info.items()}}

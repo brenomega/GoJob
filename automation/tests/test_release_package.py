@@ -13,12 +13,15 @@ from unittest.mock import patch
 
 import install_supervisor
 import recovery_dispatch
+import release_agent_recovery
+import release_commits
 import release_package
 import release_worker
 import rescue_watchdog
+import service_execution
 import upgrade_runner
 import watchdog_launcher
-from gojob_runner.tools import git
+from gojob_runner.tools import ExternalFailure, VerifiedCIFailure, git
 from release_control import ReleaseLedger
 
 
@@ -68,6 +71,25 @@ class ReleasePackageTests(unittest.TestCase):
         git(self.repo, 'push', 'origin', 'develop')
         return sha
 
+    def host(self, *args, statuses, previous=None):
+        action, unit = args[:2] if len(args) > 1 else (args[0], '')
+        if '--property=LoadState' in args:
+            return 'loaded'
+        if '--property=ActiveState' in args:
+            return 'ActiveState=inactive\nJob=0'
+        if '--property=Result' in args:
+            return statuses[unit]
+        if action == 'start':
+            identity = f'{len(statuses)+1:032x}'
+            start = service_execution.monotonic_us()
+            source = previous or (self.home/'stable').resolve().parents[1]
+            with patch.dict('os.environ', {'INVOCATION_ID': identity}):
+                service_execution.report_completion(self.home, unit.removesuffix('.service'), source)
+            ended = service_execution.monotonic_us()
+            statuses[unit] = (f'Result=success\nInvocationID=\nExecMainPID={service_execution.os.getpid()}\n'
+                              f'ExecMainStartTimestampMonotonic={start}\nExecMainExitTimestampMonotonic={ended}')
+        return {'is-enabled': 'enabled', 'is-active': 'active'}.get(action, '')
+
     def test_unit_escapes_arguments_and_keeps_working_directory_literal(self):
         repo = self.repo.parent/'repo with % signs'
         unit = install_supervisor.service(repo, '/tmp/a $tool.py')
@@ -97,20 +119,29 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertFalse((self.home/'stable').exists())
         self.assertNotIn('APPROVED_CORRECTION', (release_package.supervisor_dir(package)/'stable_supervisor.py').read_text())
 
-        calls = []
+        calls, statuses = [], {}
+        old = recovery_dispatch.promote_approved_supervisor(self.repo, self.home, self.old)
+        overlapped = False
+
         def host(*args):
+            nonlocal overlapped
             calls.append(args)
             self.assertNotEqual(ledger.status()['state'], 'INSTALLED')
-            if '--property=LoadState' in args:
-                return 'loaded'
-            return {'show': 'success', 'is-enabled': 'enabled', 'is-active': 'active'}.get(args[0], '')
+            if ('--property=ActiveState' in args and 'gojob-runner-supervisor.service' in args and not overlapped):
+                self.assertEqual((self.home/'stable').resolve(), release_package.supervisor_dir(old['package']))
+                overlapped = True
+                return 'ActiveState=activating\nJob=14'
+            return self.host(*args, statuses=statuses)
 
         with (patch.object(upgrade_runner, 'upgrade', return_value={'status': 'UPGRADED', 'merge': merge}),
               patch.object(install_supervisor, 'systemd_codex_runtime', return_value='[Service]\n'),
-              patch.object(install_supervisor, 'systemctl', side_effect=host)):
+              patch.object(install_supervisor, 'systemctl', side_effect=host),
+              patch.object(install_supervisor.time, 'sleep')):
             result = release_worker.once(self.repo, ledger=ledger, units=self.units)
         self.assertEqual(result['merge'], merge)
         self.assertEqual(ledger.status()['state'], 'INSTALLED')
+        self.assertTrue(overlapped)
+        self.assertFalse(any(call[0] in ('stop','restart') for call in calls))
         self.assertIn('APPROVED_CORRECTION', (self.home/'stable/stable_supervisor.py').read_text())
         unit = (self.units/'gojob-runner-rescue.service').read_text()
         self.assertIn(merge, unit)
@@ -163,19 +194,21 @@ class ReleasePackageTests(unittest.TestCase):
         newer = self.change_supervisor('\nCANDIDATE = True\n')
         ledger = ReleaseLedger(release_worker.VERSION, self.home)
 
+        statuses = {}
+
         def failing_host(*args):
-            if args[0] == 'start' and args[1] == 'gojob-runner-supervisor.service':
-                raise RuntimeError('synthetic host activation failure')
-            if '--property=LoadState' in args:
-                return 'loaded'
-            return {'show': 'success', 'is-enabled': 'enabled', 'is-active': 'active'}.get(args[0], '')
+            # The launcher fell back and exited successfully, but completed
+            # with the previous generation's actual receipt.
+            previous = Path(old['package']) if 'gojob-runner-rescue.service' in args else None
+            return self.host(*args, statuses=statuses, previous=previous)
 
         with (patch.object(upgrade_runner, 'upgrade', return_value={'status': 'UPGRADED', 'merge': newer}),
               patch('release_agent_recovery.diagnose_controller_failure', return_value=None),
               patch.object(install_supervisor, 'systemd_codex_runtime', return_value='[Service]\n'),
               patch.object(install_supervisor, 'systemctl', side_effect=failing_host)):
-            self.assertEqual(release_worker.once(self.repo, ledger=ledger, units=self.units)['status'],
-                             'WAITING_EXTERNAL')
+            result = release_worker.once(self.repo, ledger=ledger, units=self.units)
+        self.assertEqual(result['status'], 'WAITING_EXTERNAL')
+        self.assertIn('gojob-runner-rescue sem prova de nova execução', result['reason'])
         self.assertNotEqual(ledger.status()['state'], 'INSTALLED')
         self.assertEqual((self.home/'stable').resolve(), release_package.supervisor_dir(old['package']))
         self.assertFalse((self.units/'gojob-runner-supervisor.service').exists())
@@ -191,12 +224,53 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual((active/'stable_supervisor.py').read_text(), 'legacy = True\n')
         self.assertEqual((active/'recovery_dispatch.py').read_text(), 'legacy_dependency = True\n')
 
+    def test_release_preparation_reconciles_partial_copy_and_preserves_divergence(self):
+        (self.repo/'CHANGELOG_RUNNER.md').write_text('Release candidata\n')
+        copied_later = 'automation/supervisor/release_marker.py'
+        (self.repo/copied_later).write_text('CANDIDATE_RELEASE = True\n')
+        source = self.integrate('release package in preparation')
+        package = release_package.build_package(self.repo, source, self.home/'release-packages')
+        ledger = ReleaseLedger(release_worker.VERSION, self.home)
+        work = self.home/'release-worktrees'/f'runner-{release_worker.VERSION}'
+        journal = work.parent/f'{release_worker.VERSION}-review-cycle.json'
+        copy = release_commits.copy_package_file
+
+        def interrupted(*args):
+            intent = json.loads(journal.read_text())['preparation']
+            self.assertEqual((intent['source'], intent['manifest']['commit']), (self.old, source))
+            copy(*args)
+            raise KeyboardInterrupt
+
+        with (patch.object(upgrade_runner, 'ROOT', package),
+              patch.object(upgrade_runner, 'GitHub') as hosting,
+              patch.object(upgrade_runner, 'gates', side_effect=InterruptedError('reached local gates')),
+              patch.object(release_commits, 'copy_package_file', side_effect=interrupted) as copier):
+            hosting.return_value.get_pr.return_value = None
+            with self.assertRaises(KeyboardInterrupt):
+                upgrade_runner.upgrade_once(self.repo, ledger)
+            copied = work/copier.call_args.args[2]
+            self.assertFalse((work/copied_later).exists())
+            content = copied.read_bytes()
+            copied.write_text('alteração divergente a preservar\n')
+            with self.assertRaisesRegex(ValueError, 'Conteúdo local diverge'):
+                upgrade_runner.upgrade_once(self.repo, ledger)
+            self.assertIn('divergente', copied.read_text())
+            copied.write_bytes(content)
+            copier.side_effect = copy
+            with self.assertRaisesRegex(InterruptedError, 'reached local gates'):
+                upgrade_runner.upgrade_once(self.repo, ledger)
+        self.assertEqual(git(work, 'status', '--porcelain'), '')
+        self.assertEqual(git(work, 'rev-list', '--count', f'{self.old}..HEAD'), '1')
+        self.assertEqual((work/'CHANGELOG_RUNNER.md').read_text(), 'Release candidata\n')
+        self.assertEqual((work/copied_later).read_text(), 'CANDIDATE_RELEASE = True\n')
+
     def test_release_reviews_corrected_supervisor_merges_and_resumes_before_issue_close(self):
         branch = upgrade_runner.BRANCH
         work = self.home/'release-worktrees'/f'runner-{release_worker.VERSION}'
         work.parent.mkdir()
         git(self.repo, 'worktree', 'add', '-b', branch, str(work), self.old)
         path = work/'automation/supervisor/stable_supervisor.py'
+        companion = work/'automation/supervisor/rescue_watchdog.py'
         path.write_text(path.read_text()+'\nINITIAL_RELEASE = True\n')
         git(work, 'add', str(path.relative_to(work)))
         git(work, 'commit', '-m', 'fix(runner): publique candidato de teste [#0.11.0]')
@@ -268,9 +342,12 @@ class ReleasePackageTests(unittest.TestCase):
                 self.assertEqual(head, initial)
                 self.assertIn('Falta correção validada', prompt)
                 path.write_text(path.read_text()+'\nAPPROVED_CORRECTION = True\n')
+                companion.write_text(companion.read_text()+'\nWATCHDOG_CORRECTION = True\n')
                 return {'status': 'DONE', 'commit_plan': [{
                     'message': 'fix(runner): valide executável da geração [#0.11.0]',
-                    'paths': ['automation/supervisor/stable_supervisor.py']}]}
+                    'paths': ['automation/supervisor/stable_supervisor.py']}, {
+                    'message': 'fix(runner): confirme a execução do watchdog [#0.11.0]',
+                    'paths': ['automation/supervisor/rescue_watchdog.py']}]}
             common = {'head_sha': head, 'base_sha': self.old, 'blocking_kind': 'FIXABLE',
                       'rationale': 'Revisão independente com Git local',
                       'findings': ['Falta correção validada'] if head == initial else []}
@@ -279,16 +356,30 @@ class ReleasePackageTests(unittest.TestCase):
                             alternative='geração completa', opportunity_cost='tempo', north_star_impact='implantar')
             return dict(common, decision='ACCEPT', tests_assessed=['oráculos da release'], real_evidence=['diff'])
 
-        def host(*args):
-            if '--property=LoadState' in args:
-                return 'loaded'
-            return {'show': 'success', 'is-enabled': 'enabled', 'is-active': 'active'}.get(args[0], '')
+        statuses = {}
+        interrupted = False
+
+        def interrupt_second_commit(repo, *args, **kwargs):
+            nonlocal interrupted
+            if (not interrupted and 'commit' in args and Path(repo)==work
+                and git(work, 'diff', '--cached', '--name-only')=='automation/supervisor/rescue_watchdog.py'):
+                interrupted = True
+                self.assertNotEqual(git(work, 'rev-parse', 'HEAD'), initial)
+                self.assertEqual(git(work, 'diff', '--cached', '--name-only'),
+                                 'automation/supervisor/rescue_watchdog.py')
+                raise KeyboardInterrupt
+            return git(repo, *args, **kwargs)
 
         with (patch.object(upgrade_runner, 'GitHub', Hosting),
               patch.object(upgrade_runner, 'call_codex', side_effect=agent),
               patch.object(upgrade_runner, 'gates'),
+              patch('gojob_runner.tools.git', side_effect=interrupt_second_commit),
               patch.object(install_supervisor, 'systemd_codex_runtime', return_value='[Service]\n'),
-              patch.object(install_supervisor, 'systemctl', side_effect=host)):
+              patch.object(install_supervisor, 'systemctl', side_effect=lambda *args: self.host(*args, statuses=statuses))):
+            with self.assertRaises(KeyboardInterrupt):
+                release_worker.once(self.repo, ledger=ledger, units=self.units)
+            self.assertTrue(interrupted)
+            self.assertEqual(git(work, 'rev-list', '--count', f'{initial}..HEAD'), '1')
             with self.assertRaises(KeyboardInterrupt):
                 release_worker.once(self.repo, ledger=ledger, units=self.units)
             self.assertFalse((self.home/'stable').exists())
@@ -303,6 +394,8 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertCountEqual([label for label, _ in agent_calls[3:]],
                               ['release-reviewer-strategic', 'release-reviewer-technical'])
         self.assertIn('APPROVED_CORRECTION', (self.home/'stable/stable_supervisor.py').read_text())
+        self.assertIn('WATCHDOG_CORRECTION', (self.home/'stable/rescue_watchdog.py').read_text())
+        self.assertEqual(git(work, 'rev-list', '--count', f'{initial}..HEAD'), '2')
 
     def test_release_persists_parallel_report_and_gates_before_launching_reviewers(self):
         state = {'rounds': []}
@@ -360,6 +453,84 @@ class ReleasePackageTests(unittest.TestCase):
                 self.old)
         self.assertEqual(calls.count('strategic'), 1)
         self.assertEqual(calls.count('technical'), 2)
+
+    def test_verified_red_ci_calls_bounded_repair_before_fresh_review(self):
+        branch = upgrade_runner.BRANCH
+        work = self.home/'ci-worktree'
+        git(self.repo, 'worktree', 'add', '-b', branch, str(work), self.old)
+        candidate = 'automation/supervisor/ci_example.py'
+        (work/candidate).write_text('RUNNER_CHECK = False\n')
+        git(work, 'add', candidate)
+        git(work, 'commit', '-m', 'fix(runner): publique correção inicial [#0.11.0]')
+        initial = git(work, 'rev-parse', 'HEAD')
+        git(work, 'push', '-u', 'origin', branch)
+        evidence = {'pr': 15, 'head': initial, 'base': self.old, 'run_id': 6, 'run_attempt': 2, 'job_id': 38}
+        ledger = ReleaseLedger(release_worker.VERSION, self.home)
+        journal = self.home/'ci-review-cycle.json'
+        state = {'rounds': []}
+        calls = []
+
+        class Hosting:
+            def snapshot(_, pr, selected, head, base):
+                self.assertEqual((pr, selected, base), (15, branch, self.old))
+                self.assertEqual(git(work, 'ls-remote', 'origin', 'refs/heads/'+branch).split()[0], head)
+
+            def checks(own, pr, head, base, selected):
+                own.snapshot(pr, selected, head, base)
+                calls.append(('ci', head))
+                if head == initial:
+                    raise VerifiedCIFailure(evidence)
+                self.assertEqual(git(work, 'show', f'{head}:{candidate}'), 'RUNNER_CHECK = True')
+                return {'pr': pr, 'head': head, 'base': base}
+
+            def comment(self, *args):
+                pass
+
+        def diagnose_or_repair(repo, schema, prompt, write, timeout, *, label, ledger):
+            self.assertEqual(json.loads(journal.read_text())['active_correction']['ci_failure'], evidence)
+            self.assertEqual(git(repo, 'rev-parse', 'HEAD'), initial)
+            if not write:
+                calls.append(('triage', initial))
+                self.assertIn('job verify vermelho', prompt)
+                return {'decision': 'REPAIR_RUNNER', 'cause': 'asserção do runner encontrou False',
+                        'evidence': ['teste local reproduziu o resultado do job 38'], 'plan': 'corrigir a condição'}
+            calls.append(('repair', initial))
+            if calls.count(('repair', initial)) == 1:
+                (repo/candidate).write_text('RUNNER_CHECK = 0\n')
+            else:
+                self.assertIn('RUNNER_CHECK = 0', (repo/candidate).read_text())
+                self.assertIn('asserção local ainda falha', prompt)
+                (repo/candidate).write_text('RUNNER_CHECK = True\n')
+            return {'status': 'DONE', 'commit_plan': [
+                {'message': 'fix(runner): corrija a condição do teste [#0.11.0]', 'paths': [candidate]}]}
+
+        def review(repo, schema, *_args, **_kwargs):
+            head = git(repo, 'rev-parse', 'HEAD')
+            self.assertNotEqual(head, initial)
+            self.assertIn(('ci', head), calls)
+            calls.append((schema.stem, head))
+            common = {'head_sha': head, 'base_sha': self.old, 'findings': [],
+                      'rationale': 'Correção confirmada no diff do runner'}
+            if schema.stem == 'strategic':
+                return dict(common, decision='PASS', alternative='reparo', opportunity_cost='tempo', north_star_impact='continuidade')
+            return dict(common, decision='ACCEPT', real_evidence=['diff'], tests_assessed=['CI'])
+
+        def gates(repo):
+            if (repo/candidate).read_text() != 'RUNNER_CHECK = True\n':
+                raise ExternalFailure('asserção local ainda falha')
+
+        with (patch.object(release_agent_recovery, 'call_codex', side_effect=diagnose_or_repair),
+              patch.object(upgrade_runner, 'call_codex', side_effect=review),
+              patch.object(upgrade_runner, 'gates', side_effect=gates)):
+            with self.assertRaisesRegex(ExternalFailure, 'asserção local ainda falha'):
+                upgrade_runner.review_release(work, Hosting(), 15, self.old, state, journal, ledger)
+            self.assertEqual(git(work, 'rev-parse', 'HEAD'), initial)
+            state = json.loads(journal.read_text())
+            corrected = upgrade_runner.review_release(work, Hosting(), 15, self.old, state, journal, ledger)
+        self.assertEqual(calls[:5], [('ci', initial), ('triage', initial), ('repair', initial),
+                                    ('repair', initial), ('ci', corrected)])
+        self.assertCountEqual(calls[5:], [('strategic', corrected), ('technical', corrected)])
+        self.assertEqual(json.loads(journal.read_text())['corrections'][0]['ci_failure'], evidence)
 
     def test_autorepair_reconciles_merge_before_touching_advanced_base_or_closing_issue(self):
         import stable_supervisor

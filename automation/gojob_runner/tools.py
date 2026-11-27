@@ -10,6 +10,12 @@ class MergeProtectionRequired(PolicyFailure): pass
 class ExternalFailure(RuntimeError): pass
 class TransientFailure(ExternalFailure): pass
 
+class VerifiedCIFailure(PolicyFailure):
+    def __init__(self, evidence):
+        self.evidence = evidence
+        super().__init__(f"CI verify falhou no PR {evidence['pr']}, execução {evidence['run_id']}, "
+                         f"tentativa {evidence['run_attempt']}, job {evidence['job_id']}")
+
 SAFE_TRANSIENT = ('rate limit','429','503','timed out','connection reset','temporarily unavailable','could not resolve')
 
 def command(argv, cwd=None, timeout=180, env=None):
@@ -270,16 +276,19 @@ class GitHub:
         except ValueError as exc:
             raise PolicyFailure(str(exc)) from exc
 
-    def merge(self,pr,branch,head,base):
+    def require_merge_protection(self,proof):
         from .merge_evidence import require_strict_protection
 
-        proof=self.checks(pr,head,base,branch,timeout=60)
         try:
             require_strict_protection(self._api,proof)
         except TransientFailure:
             raise
         except (ValueError,ExternalFailure) as exc:
             raise MergeProtectionRequired('Confirme a proteção estrita de develop com verify do GitHub Actions, inclusive administradores') from exc
+
+    def merge(self,pr,branch,head,base):
+        proof=self.checks(pr,head,base,branch,timeout=60)
+        self.require_merge_protection(proof)
         self.snapshot(pr,branch,head,base,attempts=1)
         # GitHub enforces the base freshness (strict, including administrators)
         # at the write. The API independently compares the approved head.
@@ -312,15 +321,13 @@ def validate_path(repo,path):
         raise PolicyFailure('Caminho sensível no plano de commit')
     return path
 
-def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8,allowed_files=()):
+def validate_commit_plan(repo,task_id,report,dirty,allowed_prefixes=None,max_commits=8,allowed_files=()):
     """Controller executes structured commit *intent*, not unrestricted agent Git writes.
 
     This is necessary because Codex workspace-write may mount the Git dir read-only.
     No shell commands or arbitrary path globs from the model are executed.
     """
     if report.get('status')!='DONE':raise PolicyFailure('Agente não concluiu')
-    staged,dirty=worktree_changes(repo)
-    if staged:raise PolicyFailure('Arquivos já staged antes de aplicar plano; estado inconclusivo')
     plan=report.get('commit_plan')
     if not isinstance(plan,list) or not 1<=len(plan)<=max_commits:
         raise PolicyFailure('Plano de commits ausente/inválido')
@@ -338,23 +345,40 @@ def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8,al
             all_paths.append(path)
     if len(set(all_paths))!=len(all_paths) or set(all_paths)!=set(dirty):
         raise PolicyFailure('Plano não corresponde exatamente às alterações existentes')
+    return plan
+
+def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8,allowed_files=(),*,
+                      verified_index=(), verify_staged=None):
+    """Commit only the planned paths. A release caller may reconcile its own staged group."""
+    staged,dirty=worktree_changes(repo)
+    if set(staged)!=set(verified_index):
+        raise PolicyFailure('Arquivos já staged antes de aplicar plano; estado inconclusivo')
+    plan=validate_commit_plan(repo,task_id,report,set(staged+dirty),allowed_prefixes,max_commits,allowed_files)
+    if staged and set(staged)!=set(plan[0]['paths']):
+        raise PolicyFailure('Índice recuperado difere do próximo commit do plano')
     results=[]
-    for piece in plan:
+    for number,piece in enumerate(plan):
         # Input paths already validated and exact; no shell, wildcard, reset, or amend.
-        if worktree_changes(repo)[0]:
-            raise PolicyFailure('Índice staged antes de preparar o próximo commit; preservar estado')
-        git(repo,'--literal-pathspecs','add','--',*piece['paths'])
+        if number or not staged:
+            if worktree_changes(repo)[0]:
+                raise PolicyFailure('Índice staged antes de preparar o próximo commit; preservar estado')
+            git(repo,'--literal-pathspecs','add','--',*piece['paths'])
         try:git(repo,'diff','--cached','--check')
         except ExternalFailure as e:raise PolicyFailure('Whitespace/error no diff staged') from e
         staged_now,_=worktree_changes(repo)
         if set(staged_now)!=set(piece['paths']):
             raise PolicyFailure('Índice staged difere do plano; preservar estado para diagnóstico')
+        if verify_staged:
+            verify_staged(staged_now)
         # Check Python syntax before the controller commits this group.
         for path in piece['paths']:
             if path.endswith('.py') and (Path(repo)/path).is_file():
                 try:compile((Path(repo)/path).read_bytes(),path,'exec')
                 except SyntaxError as e:raise PolicyFailure('Plano contém sintaxe Python inválida: '+path) from e
-        git(repo,'--literal-pathspecs','commit','--only','-m',piece['message'],'--',*piece['paths'])
+        if verify_staged:
+            git(repo,'commit','-m',piece['message'])
+        else:
+            git(repo,'--literal-pathspecs','commit','--only','-m',piece['message'],'--',*piece['paths'])
         results.append(git(repo,'rev-parse','HEAD'))
     assert_clean(repo)
     return results

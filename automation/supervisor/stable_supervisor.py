@@ -16,6 +16,7 @@ from gojob_runner.agent_privacy import agent_env, redact
 from gojob_runner.review_policy import MAX_REVIEW_ROUNDS, collect_reviews, disposition, review_feedback
 from gojob_runner.tools import GitHub, MergeProtectionRequired, apply_commit_plan, worktree_changes
 from gojob_runner.merge_evidence import reconcile_merge
+from service_execution import boot_id, monotonic_us, report_completion
 try:
     from .schema_protocol import prepared_schema
     from .recovery_context import gather, prompt_context, private_write
@@ -29,6 +30,7 @@ except ImportError:
 
 MODEL='gpt-6.2-sol';EFFORT='high'
 DURABLE_REPAIR_PROTOCOL=1
+SOURCE_ROOT=Path(__file__).resolve().parents[2]
 
 def run(argv,cwd=None,timeout=180,check=True,env=None):
     try:r=subprocess.run(argv,cwd=cwd,env=env,text=True,capture_output=True,timeout=timeout)
@@ -52,7 +54,7 @@ def incident(home,repo,error,kind,runner_sha=None,stable_failure=None):
     folder=Path(home)/'incidents'/fingerprint
     folder.mkdir(parents=True,mode=0o700,exist_ok=True)
     obj={'id':fingerprint,'time':time.time(),'kind':kind,'error':redact(error),
-         'repo':str(Path(repo).resolve())}
+         'repo':str(Path(repo).resolve()),'runner_sha':runner_sha}
     for field,cmd in {'head':['git','rev-parse','HEAD'],'branch':['git','branch','--show-current']}.items():
         try:obj[field]=run(cmd,cwd=repo,timeout=20).stdout.strip()[:100]
         except Exception:obj[field]='unknown'
@@ -478,8 +480,10 @@ def repair_or_record(repo,home,location,info,diagnosis,*,claim=None):
     return run_incident_repair(repo,home,location,info,diagnosis,repair,claim=claim)
 
 
-def process_incident(repo,home,error,kind,*,source='supervisor',runner_sha=None,exit_code=None,allow_repair=True,stable_failure=None,claim=None):
+def process_incident(repo,home,error,kind,*,source='supervisor',runner_sha=None,exit_code=None,allow_repair=True,stable_failure=None,claim=None,on_record=None):
     location,info=incident(home,repo,error,kind,runner_sha=runner_sha,stable_failure=stable_failure)
+    if on_record:
+        on_record(info['id'])
     diagnosis,_=supervisor_triage(repo,home,location,info,source=source,
                                   runner_sha=runner_sha,exit_code=exit_code)
     print('[GOJOB DIAGNOSTIC] '+info['id']+' '+diagnosis.get('decision','UNAVAILABLE')+
@@ -545,8 +549,11 @@ def main(argv=None):
         # A progress-aware state record survives crashes and can be inspected
         # by an independent systemd watchdog on a later invocation.
         session=home/'supervisor_session.json'
-        atomic_json(session,{'started_at':time.time(),'repo':str(repo),'phase':'RUNNING',
-                             'pid':os.getpid(),'source_version':VERSION})
+        session_data={'started_at':time.time(),'repo':str(repo),'phase':'RUNNING',
+                      'pid':os.getpid(),'source_version':VERSION,
+                      'invocation_id':os.environ.get('INVOCATION_ID'),
+                      'boot_id':boot_id(),'observed_at':monotonic_us()}
+        atomic_json(session,session_data)
         rc=3;runner_sha=None;remaining=args.max_repairs
         def claim():
             nonlocal remaining
@@ -559,9 +566,15 @@ def main(argv=None):
             return process_incident(repo,home,error,kind,runner_sha=runner_sha,
                                     allow_repair=authorized and remaining>0,claim=claim,**kwargs)
 
+        def record_failure(ident):
+            session_data['incident_id']=ident
+            atomic_json(session,session_data)
+
         try:
             resume_pending_repairs(repo,home,repair)
             for cycle in range(args.max_repairs+2):
+                if session_data.pop('incident_id',None):
+                    atomic_json(session,session_data)
                 try:
                     result,runner_sha=resume_runner(repo,args.tasks,home,args.task_id)
                     rc=result.returncode
@@ -583,6 +596,7 @@ def main(argv=None):
                         try:proactive_cycle(repo,home,runner_sha,allow_repair=remaining>0,claim=claim)
                         except Exception as exc:
                             handle(str(exc),'proactive_scan_error',exit_code=0)
+                        report_completion(home,'gojob-runner-supervisor',SOURCE_ROOT)
                         return 0
                     error=redact(result.stderr or result.stdout or 'runner exit='+str(rc))
                     if rc==75 and cycle<args.max_repairs:
@@ -591,7 +605,7 @@ def main(argv=None):
                           70:'runner_crash'}.get(rc,'unknown_runner_exit')
                 except Exception as exc:
                     error=redact(type(exc).__name__+': '+str(exc));kind='supervisor_or_runner_exception';rc=70
-                status=handle(error,kind,exit_code=rc)
+                status=handle(error,kind,exit_code=rc,on_record=record_failure)
                 if status.get('status')=='REPAIRED':
                     continue
                 if rc==75:return 75
@@ -603,12 +617,12 @@ def main(argv=None):
             # Even a supervisor exception is classified through an independent
             # agent when Python remains capable of executing. SIGKILL is picked
             # up by the separate watchdog after restart.
-            try:handle(type(exc).__name__+': '+str(exc),'supervisor_uncaught',exit_code=70)
-            except Exception:pass
+            if not session_data.get('incident_id'):
+                try:handle(type(exc).__name__+': '+str(exc),'supervisor_uncaught',exit_code=70,on_record=record_failure)
+                except Exception:pass
             raise
         finally:
-            atomic_json(session,{'finished_at':time.time(),'repo':str(repo),
-                                 'phase':'COMPLETE','pid':os.getpid(),'exit_code':rc,
-                                 'source_version':VERSION})
+            atomic_json(session,{**session_data,'finished_at':time.time(),
+                                 'phase':'COMPLETE','exit_code':rc})
 
 if __name__=='__main__':sys.exit(main())

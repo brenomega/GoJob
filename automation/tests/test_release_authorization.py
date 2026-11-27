@@ -11,7 +11,8 @@ import release_worker
 import stable_supervisor
 import upgrade_runner
 from gojob_runner.review_policy import disposition
-from release_control import ReleaseLedger
+from gojob_runner.tools import GitHub
+from release_control import ReleaseLedger, atomic_json
 
 
 class ReleaseAuthorizationTests(unittest.TestCase):
@@ -71,8 +72,59 @@ class ReleaseAuthorizationTests(unittest.TestCase):
         with patch.object(upgrade_runner, 'upgrade', side_effect=vetos) as upgrade:
             self.assertEqual(release_worker.once(self.root, ledger=self.ledger)['status'], 'NEEDS_USER')
             self.assertEqual(release_worker.once(self.root, ledger=self.ledger)['status'], 'NEEDS_USER')
+            self.assertEqual(release_worker.once(self.root, ledger=self.ledger,
+                                                resume_merge_protection='a'*40)['status'], 'NEEDS_USER')
             upgrade.assert_called_once()
         self.assertIn('autorizar o rollout', self.ledger.status()['details']['cause'])
+
+    def test_explicit_merge_resume_requires_exact_head_and_current_server_protection(self):
+        head, base, merge = 'a'*40, 'b'*40, 'c'*40
+        proof = {'pr': 15, 'head': head, 'base': base, 'app_id': 15368}
+        common = {'head_sha': head, 'base_sha': base, 'findings': [],
+                  'rationale': 'Parecer independente vinculado ao snapshot'}
+        rounds = [{'head': head, 'base': base, 'pr': 15,
+                   'strategic': dict(common, decision='PASS', opportunity_cost='tempo',
+                                     alternative='reparo', north_star_impact='continuidade'),
+                   'technical': dict(common, decision='ACCEPT', real_evidence=['Git'], tests_assessed=['CI'])}]
+        intent = {'head': head, 'base': base, 'pr': 15, 'issue': 14, 'ci': proof}
+        path = self.root/'release-worktrees'/f'{release_worker.VERSION}-review-cycle.json'
+        atomic_json(path, {'version': release_worker.VERSION, 'rounds': rounds, 'merge_intent': intent})
+        self.ledger.emit('NEEDS_USER', 'merge_protection_required')
+        hosting = GitHub(self.root)
+        settings = {'enforce_admins': {'enabled': False},
+                    'required_status_checks': {'strict': True, 'checks': [{'context': 'verify', 'app_id': 15368}]}}
+        remote = {'state': 'OPEN'}
+
+        def merge_on_host(*args):
+            self.assertTrue(settings['enforce_admins']['enabled'])
+            remote.update(state='MERGED', mergeCommit={'oid': merge})
+
+        with (patch.object(upgrade_runner, 'GitHub', return_value=hosting),
+              patch.object(hosting, 'verify_identity'), patch.object(hosting, 'snapshot'),
+              patch.object(hosting, 'checks', return_value=proof) as ci,
+              patch.object(hosting, '_api', return_value=settings),
+              patch.object(hosting, 'pr', return_value=remote),
+              patch.object(hosting, 'gh', side_effect=merge_on_host) as write,
+              patch.object(hosting, 'issue_close'), patch.object(hosting, 'confirm_merge', return_value=merge),
+              patch.object(upgrade_runner, 'git', return_value=release_worker.VERSION),
+              patch('quickstart.enable_automation', return_value={'host_verified': True, 'commit': merge,
+                    'executions': {'gojob-runner-rescue': '1'*32, 'gojob-runner-supervisor': '2'*32}})):
+            self.assertEqual(release_worker.once(self.root, ledger=self.ledger)['status'], 'NEEDS_USER')
+            self.assertEqual(release_worker.once(self.root, ledger=self.ledger,
+                                                resume_merge_protection=base)['status'], 'NEEDS_USER')
+            ci.assert_not_called()
+            self.assertEqual(release_worker.once(self.root, ledger=self.ledger,
+                                                resume_merge_protection=head)['status'], 'NEEDS_USER')
+            write.assert_not_called()
+            self.assertEqual(self.ledger.status()['event'], 'merge_protection_required')
+            settings['enforce_admins']['enabled'] = True
+            self.assertEqual(release_worker.once(self.root, ledger=self.ledger,
+                                                resume_merge_protection=head)['status'], 'INSTALLED')
+        write.assert_called_once_with('pr', 'merge', '15', '--merge', '--match-head-commit', head)
+        self.assertEqual(ci.call_count, 2)
+        current = json.loads(path.read_text())
+        self.assertEqual(current['rounds'], rounds)
+        self.assertEqual(current['merge_intent'], intent)
 
     def test_release_context_filters_reports_logs_and_agent_environment(self):
         with patch.dict(os.environ, {'GOJOB_RUNNER_TELEGRAM_BOT_TOKEN': 'synthetic-bot-value',
