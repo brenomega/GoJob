@@ -1,0 +1,1 @@
+{"type":"object","properties":{"head_sha":{"type":"string"},"base_sha":{"type":"string"},"decision":{"type":"string","enum":["MERGE","BLOCK"]},"rationale":{"type":"string"}},"required":["head_sha","base_sha","decision","rationale"],"additionalProperties":false}

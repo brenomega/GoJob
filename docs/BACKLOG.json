@@ -1,0 +1,217 @@
+{
+  "runner_version": "3.1.1",
+  "tasks": [
+    {
+      "id": "0.1.1",
+      "title": "Audite JobRadar BR existente",
+      "type": "docs",
+      "goal": "Inspecione codigo e estado live da instalação JobRadar; detecte fontes saudáveis, filtros e bugs sem alterar dados/segredos.",
+      "dependencies": [],
+      "acceptance": [
+        "Inventário real dos sources e cadência com evidência",
+        "Canários ADIMAX/NORSUL reproduzidos ou causa não demonstrada declarada",
+        "DB, env e logs intactos, hashes registrados"
+      ]
+    },
+    {
+      "id": "0.1.2",
+      "title": "Compare PPO Brave e executores existentes",
+      "type": "docs",
+      "goal": "Pesquise e teste alternativas existing-first, incluindo PPO Native Messaging e AutoApply, sem fazer candidaturas reais.",
+      "dependencies": [],
+      "acceptance": [
+        "Matriz com provas e riscos de licenças/termos",
+        "Escolha da arquitetura justificada por spike no host",
+        "Nenhuma credencial/cookie em PR"
+      ]
+    },
+    {
+      "id": "0.1.3",
+      "title": "Audite cobertura de programas e ATS",
+      "type": "docs",
+      "goal": "Levante supply de programas, summer jobs, ATS e páginas independentes no RJ/remoto Brasil.",
+      "dependencies": [],
+      "acceptance": [
+        "Corpus independente datado",
+        "Lacunas de fontes e retorno marginal documentados",
+        "Zero promessa de 100% do mercado"
+      ]
+    },
+    {
+      "id": "0.2.1",
+      "title": "Feche design e critérios de aceite da migração",
+      "type": "docs",
+      "goal": "Defina arquitetura, transições, contrato de filtros e governança de candidaturas com evidências dos spykes.",
+      "dependencies": [
+        "0.1.1",
+        "0.1.2",
+        "0.1.3"
+      ],
+      "acceptance": [
+        "Design existing-first com trade-offs reais",
+        "Plano de migração sem destruir JobRadar",
+        "Testes adversariais e critérios end-to-end documentados"
+      ]
+    },
+    {
+      "id": "1.1.1",
+      "title": "Estabeleça núcleo de coleta migrado",
+      "type": "feat",
+      "goal": "Implemente fontes e normalização reutilizando código testado do JobRadar, sem reescrever às cegas.",
+      "dependencies": [
+        "0.2.1"
+      ],
+      "acceptance": [
+        "Resultados de fontes comparados com baseline",
+        "Deduplicação e liveness com fontes oficiais",
+        "Testes negativos e integração com mocks somente de fronteira"
+      ]
+    },
+    {
+      "id": "1.2.1",
+      "title": "Implemente filtros configuráveis de oportunidade",
+      "type": "feat",
+      "goal": "Conjunto por áreas, senioridade, modalidade e estados; negativos fora de tecnologia e remote unknown; programas de estágio incluídos.",
+      "dependencies": [
+        "1.1.1"
+      ],
+      "acceptance": [
+        "Usuário configura TI e futuras áreas, estágio/júnior, modalidades e estados",
+        "ADIMAX e NORSUL não notificáveis como TI",
+        "Amostra independente mede precisão e recall por dimensão"
+      ]
+    },
+    {
+      "id": "1.3.1",
+      "title": "Cubra programas de estágio e de verão",
+      "type": "feat",
+      "goal": "Adicione lanes de programas e dados sem depender apenas de job boards.",
+      "dependencies": [
+        "1.1.1"
+      ],
+      "acceptance": [
+        "Programas de verão, generalistas com alocação tech e estágio localizados",
+        "Prazos e modalidade verificados",
+        "Unique yield, frescor e falhas reportados"
+      ]
+    },
+    {
+      "id": "2.1.1",
+      "title": "Implemente onboarding dos dois formulários",
+      "type": "feat",
+      "goal": "Perfil/preferências e plataformas/cadastros, diversidade opcional com consentimento e cofre.",
+      "dependencies": [
+        "0.2.1"
+      ],
+      "acceptance": [
+        "Formulários testados com dados sintéticos",
+        "Diversidade nunca inferida ou obrigatória",
+        "Nenhum dado pessoal em Git/telemetria pública"
+      ]
+    },
+    {
+      "id": "2.2.1",
+      "title": "Implemente currículos fornecidos e seleção",
+      "type": "feat",
+      "goal": "Biblioteca de 5–10 arquivos fornecidos; escolha determinística por alvo, sem geração de currículos.",
+      "dependencies": [
+        "2.1.1"
+      ],
+      "acceptance": [
+        "Seleção por família e skills confirmadas",
+        "Não gera currículos, não reescreve documentos",
+        "Variação ATS com perfil próprio sinalizada"
+      ]
+    },
+    {
+      "id": "2.3.1",
+      "title": "Implemente registro de plataformas e elegibilidade",
+      "type": "feat",
+      "goal": "Usar plataforma cadastrada e perfil atualizado sem editar currículo estruturado Gupy/Vagas.",
+      "dependencies": [
+        "2.1.1"
+      ],
+      "acceptance": [
+        "Estado de sessão e completude verificados",
+        "Desatualização = NEEDS_USER",
+        "Campos de candidatura específicos tratados separadamente"
+      ]
+    },
+    {
+      "id": "3.1.1",
+      "title": "Prove integração Brave com host local",
+      "type": "feat",
+      "goal": "Extensão MV3/Native Messaging segura a partir do estudo existing-first.",
+      "dependencies": [
+        "0.1.2",
+        "2.3.1"
+      ],
+      "acceptance": [
+        "Provas em Brave no BigLinux",
+        "Sem exportar cookies e sem bypass MFA/CAPTCHA",
+        "Formulário sintético e autorização por domínio"
+      ]
+    },
+    {
+      "id": "3.2.1",
+      "title": "Implemente Gupy e personalização por vaga",
+      "type": "feat",
+      "goal": "Reaproveite currículo da plataforma; apresentação até 1500 caracteres e três skills previamente aprovadas.",
+      "dependencies": [
+        "3.1.1",
+        "2.2.1"
+      ],
+      "acceptance": [
+        "Não editar perfil estruturado",
+        "Texto e skills não inventados, limites testados",
+        "Pergunta desconhecida conduz a NEEDS_USER"
+      ]
+    },
+    {
+      "id": "3.3.1",
+      "title": "Implemente executor genérico e idempotência",
+      "type": "feat",
+      "goal": "Fluxos simples e extensos com intenção durável, confirmação oficial e decisão conservadora.",
+      "dependencies": [
+        "3.1.1"
+      ],
+      "acceptance": [
+        "Timeout após clique não duplica inscrição",
+        "Comprovante inequívoco para submitted",
+        "Queda e recuperação demonstradas em simulação realista"
+      ]
+    },
+    {
+      "id": "4.1.1",
+      "title": "Integre Telegram somente para exceções",
+      "type": "feat",
+      "goal": "Reutilize o bot do JobRadar com credenciais locais sem copiar para o repo.",
+      "dependencies": [
+        "3.3.1"
+      ],
+      "acceptance": [
+        "NEEDS_USER com motivo e link",
+        "Não notificar sucessos por padrão",
+        "Sem vazamento de credenciais no log"
+      ]
+    },
+    {
+      "id": "4.2.1",
+      "title": "Homologue rollout gradual no ambiente real",
+      "type": "test",
+      "goal": "Dry-run, assistido e automático por ATS sob consentimento e kill switch.",
+      "dependencies": [
+        "1.2.1",
+        "1.3.1",
+        "3.2.1",
+        "3.3.1",
+        "4.1.1"
+      ],
+      "acceptance": [
+        "Ciclo real homologado com consentimento",
+        "Zero replay de inscrição incerta",
+        "Métricas e desvio estratégico revistos independentemente"
+      ]
+    }
+  ]
+}

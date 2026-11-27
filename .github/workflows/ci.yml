@@ -1,0 +1,55 @@
+name: gojob-verify
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Baseline and runner tests
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py' -v
+          PYTHONPATH=automation:automation/supervisor:. python -m unittest discover -s automation/tests -p 'test_*.py' -v
+          PYTHONPATH=automation python -m compileall -q automation/gojob_runner
+      - name: Verify product has a test ownership boundary
+        run: |
+          PYTHONPATH=automation python - <<'PYCODE'
+          import subprocess,sys
+          from gojob_runner.tools import is_product_test_path
+          tracked=subprocess.check_output(['git','ls-files'],text=True).splitlines()
+          code=[p for p in tracked if p.endswith(('.py','.ts','.tsx','.js','.jsx','.java','.go','.rs','.kt','.cs'))
+                and not is_product_test_path(p) and not p.startswith(('automation/','scripts/'))]
+          tests=[p for p in tracked if is_product_test_path(p) and p!='tests/test_bootstrap.py'
+                 and not p.startswith('automation/')]
+          if code and not tests:
+              sys.exit('Product code exists without product tests owned by Codex Test Engineer')
+          print(f'Product code files: {len(code)}, product test files: {len(tests)}')
+          PYCODE
+      - name: Project-specific quality gates — every detected toolchain
+        run: |
+          set -euo pipefail
+          if [ -f pyproject.toml ]; then
+            python -m pip install -e '.[test]'
+            python -m pytest -q
+          fi
+          if [ -f package.json ]; then
+            npm ci
+            npm test
+          fi
+          if [ -f pom.xml ]; then
+            mvn --batch-mode verify
+          fi
+          if [ -f go.mod ]; then
+            go test ./...
+          fi
+          if [ -f Cargo.toml ]; then
+            cargo test --workspace
+          fi
