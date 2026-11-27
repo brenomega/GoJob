@@ -2,9 +2,11 @@
 from __future__ import annotations
 import json, os, re, subprocess, sys, time
 from pathlib import Path
+from .agent_privacy import agent_env, redact
 
 class PolicyFailure(RuntimeError): pass
 class BaseAdvanced(PolicyFailure): pass
+class MergeProtectionRequired(PolicyFailure): pass
 class ExternalFailure(RuntimeError): pass
 class TransientFailure(ExternalFailure): pass
 
@@ -20,18 +22,14 @@ def command(argv, cwd=None, timeout=180, env=None):
     except subprocess.TimeoutExpired as e:
         raise TransientFailure(f'timeout de {argv[0]}, efeito externo inconclusivo') from e
     if result.returncode:
-        diagnostic=(result.stderr or result.stdout)[-1400:]
+        diagnostic=redact(result.stderr or result.stdout)[-1400:]
         if any(s in diagnostic.lower() for s in SAFE_TRANSIENT):
             raise TransientFailure(f'{argv[0]} indisponível: {diagnostic}')
         raise ExternalFailure(f'{argv[0]} exit={result.returncode}: {diagnostic}')
     return result.stdout.strip()
 
 def clean_env():
-    env=os.environ.copy()
-    for k in ('OPENAI_API_KEY','CODEX_API_KEY','GH_TOKEN','GITHUB_TOKEN','GOJOB_VAULT_KEY', 'TELEGRAM_BOT_TOKEN'):
-        env.pop(k,None)
-    env['PYTHONDONTWRITEBYTECODE']='1'
-    return env
+    return {**agent_env(), 'PYTHONDONTWRITEBYTECODE': '1'}
 
 def git(repo,*args,timeout=180):
     return command(['git',*args],cwd=repo,timeout=timeout)
@@ -155,18 +153,21 @@ class GitHub:
     def __init__(self,repo,owner='brenomega/GoJob'):
         self.repo=Path(repo).resolve();self.owner=owner
     def gh(self,*argv,timeout=180):return command(['gh',*argv],cwd=self.repo,timeout=timeout)
-    def preflight(self):
+    def verify_identity(self):
         git(self.repo,'rev-parse','--is-inside-work-tree')
         remote=git(self.repo,'remote','get-url','origin')
         acceptable={f'https://github.com/{self.owner}.git',f'https://github.com/{self.owner}',
                     f'git@github.com:{self.owner}.git',f'git@github.com:{self.owner}',
                     f'ssh://git@github.com/{self.owner}.git'}
         if remote not in acceptable:raise PolicyFailure('Origin deve ser '+self.owner)
-        assert_clean(self.repo)
         self.gh('auth','status')
         identity=self.gh('api','user','--jq','.login').strip()
         if identity.lower()!='brenomega':
             raise PolicyFailure('Identidade GitHub inesperada: runner exige brenomega')
+        return True
+    def preflight(self):
+        self.verify_identity()
+        assert_clean(self.repo)
         return True
     def get_issue(self,title):
         rows=json.loads(self.gh('issue','list','--state','all','--limit','200','--json','number,title,state'))
@@ -234,39 +235,65 @@ class GitHub:
               f'Decision: {decision}; findings: {finding_count}. '
               'Parecer completo preservado no journal privado do controlador; '
               'isto não é GitHub APPROVE.')
+        pages=json.loads(self.gh('api', f'repos/{self.owner}/issues/{pr}/comments?per_page=100',
+                                 '--paginate', '--slurp'))
+        if any(comment.get('body')==body and (comment.get('user') or {}).get('login')=='brenomega'
+               for page in pages for comment in page):
+            return
         self.gh('pr','comment',str(pr),'--body',body)
-    def checks(self,pr,head,base,branch,timeout=900):
-        """Require a real successful GitHub Actions `verify` run for exact HEAD.
+    def _api(self,path):
+        return json.loads(self.gh('api',f'repos/{self.owner}/{path}',timeout=100))
 
-        PR aggregate status can be stale, empty or from another commit. The
-        check-runs endpoint is bound to commit SHA; no mocked success accepted.
-        """
+    def checks(self,pr,head,base,branch,timeout=900):
+        from .merge_evidence import WORKFLOW, verify_ci
+
+        if git(self.repo,'rev-parse',f'{base}:{WORKFLOW}') != git(self.repo,'rev-parse',f'{head}:{WORKFLOW}'):
+            raise PolicyFailure('Workflow de verificação diverge da versão confiável em develop')
         deadline=time.monotonic()+timeout
         while time.monotonic()<deadline:
             self.snapshot(pr,branch,head,base,attempts=1)
-            payload=json.loads(self.gh('api',f'repos/{self.owner}/commits/{head}/check-runs',timeout=100))
-            runs=payload.get('check_runs',[])
-            matching=[x for x in runs if x.get('name')=='verify' and x.get('head_sha')==head]
-            if matching:
-                latest=sorted(matching,key=lambda x:x.get('id',0))[-1]
-                if latest.get('status')=='completed':
-                    if latest.get('conclusion')=='success':return [latest]
-                    raise PolicyFailure('CI verify não aprovou HEAD: '+str(latest.get('conclusion')))
+            try:
+                proof=verify_ci(self._api,pr,head,base)
+            except ValueError as exc:
+                raise PolicyFailure(str(exc)) from exc
+            if proof:
+                return proof
             time.sleep(15)
-        raise TransientFailure('CI verify não confirmado para HEAD exato; preservar PR')
+        raise TransientFailure('CI verify não confirmado para PR, HEAD e BASE exatos; preservar PR')
+
+    def confirm_merge(self,pr_info,branch,head,base):
+        from .merge_evidence import reconcile_merge
+
+        try:
+            return reconcile_merge(lambda *args: git(self.repo,*args),pr_info,
+                                   head=head,base=base,branch=branch)
+        except ValueError as exc:
+            raise PolicyFailure(str(exc)) from exc
+
     def merge(self,pr,branch,head,base):
+        from .merge_evidence import require_strict_protection
+
+        proof=self.checks(pr,head,base,branch,timeout=60)
+        try:
+            require_strict_protection(self._api,proof)
+        except TransientFailure:
+            raise
+        except (ValueError,ExternalFailure) as exc:
+            raise MergeProtectionRequired('Confirme a proteção estrita de develop com verify do GitHub Actions, inclusive administradores') from exc
         self.snapshot(pr,branch,head,base,attempts=1)
-        self.checks(pr,head,base,branch,timeout=60)
+        # GitHub enforces the base freshness (strict, including administrators)
+        # at the write. The API independently compares the approved head.
         self.gh('pr','merge',str(pr),'--merge','--match-head-commit',head)
         item=self.pr(pr)
         if item.get('state')!='MERGED' or not item.get('mergeCommit'):
             raise TransientFailure('Resultado do merge incerto: reconciliar antes de repetir')
+        self.confirm_merge(item,branch,head,base)
         return item
 
 def worktree_changes(repo):
     """Exact paths, including untracked and deletions; staged changes are not agent-owned."""
-    staged=[x for x in git(repo,'diff','--cached','--name-only','-z').split('\x00') if x]
-    modified=[x for x in git(repo,'diff','--name-only','-z').split('\x00') if x]
+    staged=[x for x in git(repo,'diff','--cached','--no-renames','--name-only','-z').split('\x00') if x]
+    modified=[x for x in git(repo,'diff','--no-renames','--name-only','-z').split('\x00') if x]
     untracked=[x for x in git(repo,'ls-files','--others','--exclude-standard','-z').split('\x00') if x]
     return staged,sorted(set(modified+untracked))
 
@@ -285,7 +312,7 @@ def validate_path(repo,path):
         raise PolicyFailure('Caminho sensível no plano de commit')
     return path
 
-def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8):
+def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8,allowed_files=()):
     """Controller executes structured commit *intent*, not unrestricted agent Git writes.
 
     This is necessary because Codex workspace-write may mount the Git dir read-only.
@@ -306,7 +333,7 @@ def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8):
             raise PolicyFailure('Commit sem arquivos explícitos')
         for path in piece['paths']:
             validate_path(repo,path)
-            if allowed_prefixes and not path.startswith(allowed_prefixes):
+            if allowed_prefixes is not None and not path.startswith(allowed_prefixes) and path not in allowed_files:
                 raise PolicyFailure('Reparo tentaria incluir arquivo fora do runner')
             all_paths.append(path)
     if len(set(all_paths))!=len(all_paths) or set(all_paths)!=set(dirty):
@@ -314,18 +341,20 @@ def apply_commit_plan(repo,task_id,report,allowed_prefixes=None,max_commits=8):
     results=[]
     for piece in plan:
         # Input paths already validated and exact; no shell, wildcard, reset, or amend.
-        git(repo,'add','--',*piece['paths'])
+        if worktree_changes(repo)[0]:
+            raise PolicyFailure('Índice staged antes de preparar o próximo commit; preservar estado')
+        git(repo,'--literal-pathspecs','add','--',*piece['paths'])
         try:git(repo,'diff','--cached','--check')
         except ExternalFailure as e:raise PolicyFailure('Whitespace/error no diff staged') from e
         staged_now,_=worktree_changes(repo)
         if set(staged_now)!=set(piece['paths']):
             raise PolicyFailure('Índice staged difere do plano; preservar estado para diagnóstico')
-        git(repo,'commit','-m',piece['message'])
-        # Per-commit smoke for Python syntax without creating a new test suite.
+        # Check Python syntax before the controller commits this group.
         for path in piece['paths']:
             if path.endswith('.py') and (Path(repo)/path).is_file():
                 try:compile((Path(repo)/path).read_bytes(),path,'exec')
-                except SyntaxError as e:raise PolicyFailure('Commit contém sintaxe Python inválida: '+path) from e
+                except SyntaxError as e:raise PolicyFailure('Plano contém sintaxe Python inválida: '+path) from e
+        git(repo,'--literal-pathspecs','commit','--only','-m',piece['message'],'--',*piece['paths'])
         results.append(git(repo,'rev-parse','HEAD'))
     assert_clean(repo)
     return results

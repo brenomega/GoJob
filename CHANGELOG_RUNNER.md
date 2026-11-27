@@ -8,16 +8,16 @@
 - CI só era checado após reviews caros, desperdiçando tokens em commits rejeitados deterministicamente. A release com oito commits não tinha margem para outro reparo, mas o sistema poderia ainda convocar implementador desnecessariamente.
 
 ### Correções
-- `quickstart.py` inicia `gojob-runner-release.service` via systemd `--no-block`, em vez de executar loops de revisão no terminal. Fechar o terminal deixa o serviço em execução; existe modo explícito `--foreground` para diagnóstico e `--status` sem login.
+- `quickstart.py --repo CAMINHO --source-sha SHA` monta o pacote a partir do commit informado e solicita ao systemd o início assíncrono do controlador. `--status` consulta o ledger local.
 - Revisores independentes executam em paralelo, cada parecer é salvo atomicamente ao concluir (por SHA/base/papel), e a retomada reaproveita apenas resultados válidos. O histórico de objeções é enviado às próximas rodadas para reduzir mudanças arbitrárias de escopo.
 - CI do HEAD é verificado antes da revisão de agentes. O orçamento de oito commits é examinado antes de invocar outro implementador; não se contorna a regra com push/force-push.
-- Codex em serviço publica heartbeat e duração a cada 20s; saída temporária privada é limitada e removida, e subprocessos são encerrados em timeout/interrupção. O journal mantém o estado para reconciliação posterior.
-- Lock de release compartilhado entre versões atuais; novas versões não disputam alterações de `develop`. O timer não reinstala uma versão já marcada como ativada.
-- Cache por fingerprint SHA-256 (sources + testes + ambiente Python) evita repetir a suíte do mesmo pacote na mesma máquina; `GOJOB_FORCE_VERIFY=1` força auditoria integral.
-- Testes adversariais de reinício entre revisores, CI antes de review, paralelismo, limite de commits, cache e interrupção de processo filho.
+- Codex em serviço registra heartbeat a cada 20 segundos. O controlador mantém a saída temporária privada, limita os trechos lidos para diagnóstico e encerra o grupo de processos em caso de timeout.
+- O lock da release é compartilhado entre versões. Supervisor e watchdog compartilham o lock do autorreparo e reservam a tentativa antes de editar. Uma intenção de merge persistida permite reconciliar a integração antes de publicar ou editar novamente.
+- A implantação usa a geração completa do merge aprovado, com manifesto de integridade e troca atômica. O watchdog pode iniciar a partir da geração anterior se a atual falhar ao importar.
+- Testes de regressão cobrem checkout limpo, interrupção entre pareceres e após merge, CI por snapshot, orçamento persistente, veto humano, escopo e fallback.
 
 ### Limites
-- Codex, GitHub e systemd reais não são exercitados nos testes offline; a atualização remota e o progresso do PR precisam ser observados após implantação.
+- O controlador do host deve confirmar o novo CI, o merge em `develop`, a execução dos serviços e os timers ativos para a geração aprovada antes de registrar `INSTALLED`. O merge exige proteção estrita do check `verify` do GitHub Actions em `develop`, inclusive para administradores.
 - Um PR já esgotado em oito commits e reprovado permanece preservado e exige continuação em nova release ou decisão; o controlador não burla orçamento nem revisão.
 - Versões anteriores do worker em execução podem concluir a tentativa já iniciada; systemd aplica a nova unidade em ciclos subsequentes.
 

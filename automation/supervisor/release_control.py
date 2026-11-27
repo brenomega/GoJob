@@ -9,26 +9,20 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import subprocess
 import signal
+import threading
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from gojob_runner.agent_privacy import redact as scrub, report_context
 
 STATES = frozenset({'PREFLIGHT','PREPARING','REVIEWING','REPAIRING',
                     'VERIFYING','MERGING','WAITING_EXTERNAL','NEEDS_USER',
                     'INSTALLED','FAILED_INTERNAL'})
 HOST_ONLY = ('systemctl --user','dbus','d-bus','user bus',
              'operation not permitted','failed to connect to bus')
-
-
-def scrub(text):
-    value=str(text)
-    value=re.sub(r'(?i)(?:gh[pousr]_|gsk_|sk-)[a-z0-9_-]{14,}', '[REDACTED]',value)
-    value=re.sub(r'(?im)((?:token|password|secret|api[_-]?key|authorization|cookie)\s*[:=]\s*)[^\s,}]+',r'\1[REDACTED]',value)
-    return value
 
 
 def atomic_json(target, data):
@@ -65,12 +59,11 @@ def safe_git(repo,*args):
 def run_codex_monitored(argv, *, cwd, env, timeout, ledger, role):
     """Execute an agent with an observable heartbeat and bounded private output.
 
-    The default unit sets GOJOB_MONITOR_CODEX=1. Tests or explicit callers
-    without that variable retain the standard subprocess contract. A Ctrl+C
-    in foreground mode terminates the isolated child process group; the
-    controller retains Git worktree and prior review checkpoints for retry.
+    The release unit sets GOJOB_MONITOR_CODEX=1 in the controller.
+    The agent gets only its allowed runtime environment. On timeout the
+    controller terminates the isolated child group and preserves the worktree.
     """
-    if env.get('GOJOB_MONITOR_CODEX')!='1':
+    if os.environ.get('GOJOB_MONITOR_CODEX')!='1':
         return subprocess.run(argv,cwd=cwd,env=env,text=True,
                               capture_output=True,timeout=timeout)
     start=time.monotonic()
@@ -106,18 +99,15 @@ def run_codex_monitored(argv, *, cwd, env, timeout, ledger, role):
                                     elapsed_seconds=round(elapsed))
                         print(f'[GOJOB AGENT] {role}: ativo há {int(elapsed)}s',flush=True)
             except (BaseException,):
-                if proc.poll() is None:
-                    try:os.killpg(proc.pid,signal.SIGTERM)
-                    except ProcessLookupError:pass
-                    try:proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        try:os.killpg(proc.pid,signal.SIGKILL)
-                        except ProcessLookupError:pass
-                        proc.wait(timeout=5)
+                try:os.killpg(proc.pid,signal.SIGTERM)
+                except ProcessLookupError:pass
+                try:proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:pass
+                try:os.killpg(proc.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                proc.wait(timeout=5)
                 ledger.emit('WAITING_EXTERNAL','agent_aborted',role=role,
-                            elapsed_seconds=round(time.monotonic()-start),
-                            stdout_tail=scrub(tail(out))[-1500:],
-                            stderr_tail=scrub(tail(err))[-1500:])
+                            elapsed_seconds=round(time.monotonic()-start))
                 raise
         elapsed=round(time.monotonic()-start)
         ledger.emit('REPAIRING' if 'implementer' in role else 'REVIEWING',
@@ -133,13 +123,26 @@ class ReleaseLedger:
         self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         self.events=self.root/'events.jsonl'
         self.status_path=self.root/'status.json'
+        self._status_lock=threading.Lock()
 
     def status(self):
-        try:return json.loads(self.status_path.read_text())
-        except (OSError,ValueError):return {'state':'PREFLIGHT','version':self.version}
+        try:
+            status=json.loads(self.status_path.read_text())
+        except FileNotFoundError:
+            return {'state':'PREFLIGHT','version':self.version}
+        if not isinstance(status,dict) or status.get('state') not in STATES:
+            raise ValueError('Estado persistido de release inválido; preservar para reconciliação')
+        return status
 
     def emit(self,state,event,**info):
+        with self._status_lock:
+            return self._emit(state,event,info)
+
+    def _emit(self,state,event,info):
         if state not in STATES:raise ValueError('unknown release state '+state)
+        current=self.status()
+        if current.get('state')=='NEEDS_USER':
+            return current
         payload={'timestamp':time.time(),'version':self.version,'state':state,'event':event,
                  'details':{str(k):scrub(v)[:3000] for k,v in info.items()}}
         fd=os.open(self.events,os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
@@ -162,17 +165,13 @@ class ReleaseLedger:
         filename=f'{int(time.time()*1000)}-{uuid.uuid4().hex[:10]}.json'
         location=folder/filename
         atomic_json(location,{'timestamp':time.time(),'role':scrub(role)[:100],
-            'returncode':returncode,'stdout_tail':scrub(stdout)[-12000:],
-            'stderr_tail':scrub(stderr)[-12000:],
+            'returncode':returncode,
             'report_summary':scrub((report or {}).get('summary',''))[:2000]})
         return location
 
     @contextmanager
     def exclusive(self,nonblock=True):
-        # Coordinate all current and future releases through one lock. Two
-        # independent versions must never merge against develop concurrently.
         lock=self.home/'release-control/release-global.lock'
-        lock.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
         descriptor=os.open(lock,os.O_CREAT|os.O_RDWR,0o600)
         try:
             flags=fcntl.LOCK_EX|(fcntl.LOCK_NB if nonblock else 0)
@@ -191,16 +190,21 @@ class ReleaseLedger:
         documents={}
         for name in ('AGENTS.md','docs/PRODUCT_NORTH_STAR.md','docs/DECISION_LEDGER.md',
                      'docs/ENGINEERING_POLICY.md','docs/STRATEGIC_REVIEW.md',
-                     'docs/TESTING_POLICY.md','docs/RUNNER_OPERATING_CONTRACT.md'):
+                     'docs/TESTING_POLICY.md','docs/RUNNER_OPERATING_CONTRACT.md',
+                     'docs/RELEASE_ARCHITECTURE.md','docs/RUNNER_THROUGHPUT.md'):
             documents[name]=checked_read(worktree/name,14000)
-        candidate=Path(__file__).resolve().parent
-        documents['release/RECOVERY_PLAYBOOK.md']=checked_read(candidate/'docs/RECOVERY_PLAYBOOK.md',16000)
-        documents['release/ARCHITECTURE.md']=checked_read(candidate/'docs/RELEASE_ARCHITECTURE.md',18000)
         records=sorted((self.root/'agent-logs').glob('*.json'),key=lambda f:f.name)[-5:]
-        agent_logs={f.name:checked_read(f,12500) for f in records}
+        agent_logs={}
+        for record in records:
+            try:
+                item=json.loads(record.read_text())
+                agent_logs[record.name]={key: scrub(item[key]) for key in ('role','returncode') if key in item}
+            except (OSError,ValueError):
+                continue
         try:
-            event_lines=self.events.read_text(encoding='utf8').splitlines()[-12:]
-        except OSError:
+            events=[json.loads(line) for line in self.events.read_text(encoding='utf8').splitlines()[-12:]]
+            event_lines=[{key: item.get(key) for key in ('state','event','timestamp')} for item in events]
+        except (OSError,ValueError):
             event_lines=[]
         packet={'version':self.version,'stage':stage,'error':scrub(error)[:5000],
                 'attempt':attempt,'recorded_at':time.time(),
@@ -210,11 +214,10 @@ class ReleaseLedger:
                 'worktree':str(worktree),'git':{
                     'head':safe_git(worktree,'rev-parse','HEAD'),
                     'branch':safe_git(worktree,'branch','--show-current'),
-                    'status':safe_git(worktree,'status','--porcelain=v1','-uall'),
-                    'diff_stat':safe_git(worktree,'diff','--stat'),
-                    'recent_commits':safe_git(worktree,'log','-6','--format=%h %s')},
-                'feedback':feedback or {},'developer_report':last_report or {},
-                'agent_logs':agent_logs,'recent_events':event_lines,'documents':documents,'previous_status':self.status()}
+                    'diff_stat':safe_git(worktree,'diff','--shortstat'),
+                    'recent_commits':safe_git(worktree,'log','-6','--format=%H')},
+                'feedback':report_context(feedback or {}),'developer_report':report_context(last_report or {}),
+                'agent_logs':agent_logs,'recent_events':event_lines,'documents':documents,'previous_status':self.status().get('state')}
         encoded=json.dumps(packet,ensure_ascii=False,default=str)
         sha=hashlib.sha256(encoded.encode()).hexdigest()
         location=self.root/'incidents'/f'{int(time.time())}-{sha[:12]}'
@@ -226,7 +229,7 @@ class ReleaseLedger:
                  'environment_boundary':packet['environment_boundary'],
                  'git':packet['git'],'feedback':packet['feedback'],
                  'developer_report':packet['developer_report'],
-                 'agent_logs':{k:v.get('excerpt','')[:8500] for k,v in agent_logs.items()},
+                 'agent_logs':agent_logs,
                  'recent_events':event_lines,
                  'documents':{k:{'sha256':v.get('sha256'),'excerpt':v.get('excerpt','')[:6200]}
                               for k,v in documents.items()},

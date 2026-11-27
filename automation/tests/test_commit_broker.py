@@ -46,4 +46,21 @@ class CommitBroker(unittest.TestCase):
         (self.repo/'code.py').write_text('x=1\n')
         with self.assertRaises(PolicyFailure):apply_commit_plan(self.repo,'1.2.1',{'status':'DONE'})
 
+    def test_runner_repair_preserves_index_with_preexisting_out_of_scope_file(self):
+        from stable_supervisor import apply_repair_commit_plan
+
+        (self.repo/'README.md').write_text('Staged by a different owner.\n')
+        git(self.repo,'add','README.md')
+        target=self.repo/'automation/supervisor/example.py'
+        target.parent.mkdir(parents=True)
+        target.write_text('value = 42\n')
+        head=git(self.repo,'rev-parse','HEAD')
+        report={'status':'DONE','commit_plan':[{
+            'message':'fix(runner): corrija retomada do supervisor [#0.9.0]',
+            'paths':['automation/supervisor/example.py']}]}
+        with self.assertRaisesRegex(PolicyFailure,'staged'):
+            apply_repair_commit_plan(self.repo,report)
+        self.assertEqual(git(self.repo,'rev-parse','HEAD'),head)
+        self.assertEqual(worktree_changes(self.repo),(['README.md'],['automation/supervisor/example.py']))
+
 if __name__=='__main__':unittest.main()

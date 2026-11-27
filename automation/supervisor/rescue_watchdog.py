@@ -7,11 +7,16 @@ A verified older supervisor is used only as a fallback repair engine, never
 for rewriting product state or bypassing policy.
 """
 from __future__ import annotations
-import argparse,fcntl,glob,hashlib,importlib.util,json,os,subprocess,sys,time
+import argparse,fcntl,json,os,subprocess,sys,time
 from pathlib import Path
+
+if __name__ == '__main__':
+    sys.path[:0]=map(str,Path(__file__).resolve().parents[:2])
+
+from gojob_runner.agent_privacy import agent_env
 from schema_protocol import prepared_schema
 from recovery_context import redact
-from recovery_dispatch import read_json,triage_event,repair_allowed,record_repair_attempt,save_json,promote_approved_supervisor
+from recovery_dispatch import read_json,triage_event,save_json,incident_key,run_incident_repair,resume_pending_repairs
 
 MODEL='gpt-6.2-sol'
 
@@ -20,9 +25,7 @@ def agent(repo,prompt,schema,write):
     with tempfile.TemporaryDirectory(prefix='gojob-rescue-') as td:
         target=Path(td)/'response.json'
         cli_schema=prepared_schema(schema,td)
-        env=os.environ.copy()
-        for name in ('GH_TOKEN','GITHUB_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','TELEGRAM_BOT_TOKEN','GOJOB_VAULT_KEY'):
-            env.pop(name,None)
+        env=agent_env()
         import shutil
         binary=os.environ.get('GOJOB_CODEX_BIN')
         if not binary or not os.path.isfile(binary) or not os.access(binary,os.X_OK):
@@ -45,41 +48,50 @@ def service_status():
     except Exception as e:return {'unavailable':type(e).__name__}
 
 def fallback_repair(repo,home,inc,info,stable_folder):
-    # Source chosen only from verified previous local installations; not a
-    # spontaneous unchecked download or the mutable product checkout.
-    candidates=sorted(Path(stable_folder).glob('stable_supervisor.previous.*.py'),
-                      key=lambda p:p.stat().st_mtime,reverse=True)
-    current=Path(stable_folder)/'stable_supervisor.py'
-    if current.exists():candidates.append(current)
+    # Load each candidate in a new process so its own sibling modules win over
+    # modules already loaded by this watchdog. An import failure has no effects.
+    previous=Path(home)/'stable.previous'
+    candidates=[Path(stable_folder),previous,Path(__file__).resolve().parent]
+    load_engine=(
+        'import json, sys; from pathlib import Path; '
+        'folder=Path(sys.argv[1]).resolve(); '
+        'sys.path[:0]=[str(folder), str(folder.parent)]; '
+        'from release_package import verify_package; verify_package(folder.parents[1]); '
+        'import stable_supervisor as engine; '
+        'assert engine.DURABLE_REPAIR_PROTOCOL == 1; '
+    )
     errors=[]
-    for candidate in candidates:
-        module=None
-        try:
-            spec=importlib.util.spec_from_file_location('gojob_last_good_'+hashlib.sha256(str(candidate).encode()).hexdigest()[:12],candidate)
-            module=importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            if not callable(getattr(module,'repair',None)):
-                raise RuntimeError('Repair API absent')
-            repair_info=dict(info)
-            # Older last-known-good supervisors do not know the v3.4 dossier
-            # format. Pass its private context through the incident payload,
-            # not through the public GitHub Issue body (which uses error only).
-            if '.previous.' in candidate.name:
-                dossier=Path(home)/'incidents'/inc/'context.json'
-                if dossier.is_file():
-                    repair_info['handoff_context']=redact(dossier.read_text(encoding='utf-8',errors='replace'))[:60000]
-                    repair_info['handoff_sha256']=hashlib.sha256(dossier.read_bytes()).hexdigest()
-            return module.repair(repo,home,inc,repair_info)
-        except Exception as e:
-            errors.append(candidate.name+': '+type(e).__name__+': '+redact(e)[:250])
-            # An exception during an external write could have created a PR;
-            # never blindly repeat with another candidate after side effects.
-            if callable(getattr(module,'repair',None)):break
-    raise RuntimeError('Fallback repair engines unavailable: '+'; '.join(errors[-3:]))
+    for directory in dict.fromkeys(path.resolve() for path in candidates if path.is_dir()):
+        args=[sys.executable,'-I','-B','-c',load_engine,str(directory)]
+        check=subprocess.run(args,capture_output=True,text=True,timeout=20)
+        if check.returncode:
+            errors.append(directory.name+': '+redact(check.stderr)[-200:])
+            continue
+        handler=load_engine+(
+            'payload=json.load(sys.stdin); result=engine.repair(*payload); '
+            'print("GOJOB_REPAIR_RESULT "+json.dumps(result));'
+        )
+        result=subprocess.run([*args[:4],handler,str(directory)],
+                              input=json.dumps([str(repo),str(home),inc,info]),
+                              capture_output=True,text=True,timeout=8*3600)
+        # Do not invoke another generation after an attempt that could write.
+        if result.returncode:
+            raise RuntimeError('Reparo via geração anterior pendente: '+redact(result.stderr)[-450:])
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith('GOJOB_REPAIR_RESULT '):
+                return json.loads(line.removeprefix('GOJOB_REPAIR_RESULT '))
+        raise RuntimeError('Reparo iniciado sem resultado verificável')
+    raise RuntimeError('Fallback repair engines unavailable: '+'; '.join(errors))
+
 
 def check(repo,home,*,force=False,now=None):
     repo=Path(repo).resolve();home=Path(home).resolve()
     now=time.time() if now is None else now
+    def repair(repo,home,ident,evidence):
+        return fallback_repair(repo,home,ident,evidence,home/'stable')
+    resumed=resume_pending_repairs(repo,home,repair)
+    if resumed is not None:
+        return resumed
     status=service_status()
     active=status.get('ActiveState')
     result=status.get('Result')
@@ -90,8 +102,9 @@ def check(repo,home,*,force=False,now=None):
                                and result not in (None,'','success')))
     stale=(session.get('phase')=='RUNNING' and now-session.get('started_at',now)>9*3600 and active not in ('active','activating'))
     if not (failed or stale or force):return {'status':'HEALTHY_OR_IDLE','service':status}
-    info_text='Supervisor unexpected stop: '+json.dumps({'status':status,'session':session},ensure_ascii=False)
-    fingerprint=hashlib.sha256((str(repo)+'|watchdog|'+info_text).encode()).hexdigest()[:14]
+    failure = {'Result': result, 'ExecMainStatus': status.get('ExecMainStatus')}
+    info_text='Supervisor unexpected stop: '+json.dumps(failure,sort_keys=True)
+    fingerprint=incident_key(repo,'watchdog_supervisor_crash',info_text)
     folder=home/'incidents'/fingerprint
     prior=read_json(folder/'incident.json',{})
     info={'id':fingerprint,'repo':str(repo),'kind':'watchdog_supervisor_crash',
@@ -100,20 +113,8 @@ def check(repo,home,*,force=False,now=None):
     save_json(folder/'incident.json',info)
     diagnosis,evidence=triage_event(repo,home,folder,info,agent_func=agent,
                                      source='independent_watchdog',exit_code=status.get('ExecMainStatus'))
-    outcome={'status':diagnosis.get('decision'),'incident':fingerprint}
-    if diagnosis.get('decision')=='REPAIR_RUNNER' and repair_allowed(folder):
-        try:
-            old=read_json(folder/'repair.json',None)
-            approved=old if old is not None else fallback_repair(repo,home,fingerprint,info,home/'stable')
-            save_json(folder/'repair.json',approved)
-            outcome['repair']=approved
-            outcome['deployment']=promote_approved_supervisor(repo,home,expected_merge=approved.get('merge'))
-            outcome['status']='REPAIRED'
-            record_repair_attempt(folder,'SUCCEEDED')
-        except Exception as exc:
-            record_repair_attempt(folder,'FAILED',str(exc))
-            outcome['status']='REPAIR_PENDING_OR_FAILED'
-            outcome['error']=redact(exc)[:500]
+    outcome=run_incident_repair(repo,home,folder,info,diagnosis,repair)
+    outcome['incident']=fingerprint
     save_json(folder/'watchdog_action.json',outcome)
     print('[GOJOB RESCUE] '+json.dumps(outcome,ensure_ascii=False)[:1300],flush=True)
     return outcome

@@ -2,8 +2,9 @@
 from __future__ import annotations
 import tempfile,unittest,subprocess,shutil
 from pathlib import Path
+from unittest.mock import patch
 from gojob_runner.runner import Runner
-from gojob_runner.tools import git,PolicyFailure
+from gojob_runner.tools import git,PolicyFailure,TransientFailure
 
 
 class SpecialistCodex:
@@ -35,6 +36,8 @@ class FakeSCM:
     def pr(self,number):
         self.called.append(('pr',number))
         return {'state':'OPEN'}
+    def snapshot(self,*args):
+        self.called.append(('snapshot',args))
 
 
 class BlockedRecovery(unittest.TestCase):
@@ -90,9 +93,13 @@ class BlockedRecovery(unittest.TestCase):
         (self.work/'docs/AUDITORIA.md').write_text('Primeira pesquisa incompleta\n')
         git(self.work,'add','.');git(self.work,'commit','-m','docs(auditoria): registre estudo inicial [#0.1.2]')
         old=git(self.work,'rev-parse','HEAD')
+        snapshot={'head_sha':old,'base_sha':self.base,'blocking_kind':'FIXABLE',
+                  'rationale':'Revisão independente verificou lacunas concretas de cobertura'}
         self.runner.record('0.1.2','REVIEW_BLOCK',stage='BLOCKED',pr=5,
-                           review_head=old,strategic={'decision':'REVISE','findings':['Falta prova de estágio de verão']},
-                           technical={'decision':'REVISE','findings':['Oráculo insuficiente']},
+                           review_head=old,strategic={**snapshot,'decision':'REVISE','findings':['Falta prova de estágio de verão'],
+                                      'opportunity_cost':'Tempo','alternative':'Inspeção','north_star_impact':'Cobertura'},
+                           technical={**snapshot,'decision':'REVISE','findings':['Oráculo insuficiente'],
+                                      'tests_assessed':['suite'],'real_evidence':['diff']},
                            findings={'strategic':['Falta prova de estágio de verão'],
                                      'technical':['Oráculo insuficiente']},
                            reason='Reparo não concluído')
@@ -105,6 +112,100 @@ class BlockedRecovery(unittest.TestCase):
         self.assertIsNone(state['ci_head'])
         self.assertNotEqual(result['head'],old)
         self.assertIn('Falta prova',self.codex.calls[1][2])
+    def test_review_resume_persists_each_role_before_comments_and_integrates_at_limit(self):
+        (self.work/'docs'/'candidate.md').write_text('Candidato ao último parecer.\n')
+        git(self.work,'add','docs/candidate.md')
+        git(self.work,'commit','-m','docs(evidencia): registre evidência concreta [#0.1.2]')
+        head=git(self.work,'rev-parse','HEAD')
+        self.runner.record('0.1.2','READY',stage='PR',issue=4,pr=5,head=head,review_rounds_total=2)
+        calls=[]
+        self_outer=self
+        base=self.base
+
+        class Hosting(FakeSCM):
+            def checks(self,pr,commit,target,branch):
+                calls.append('ci')
+                return {'pr':pr,'head':commit,'base':target}
+
+            def comment(self,*args):
+                state=self_outer.runner.entry('0.1.2')
+                assert state['review_rounds_total']==3
+                assert state['review_history'][-1]['technical']['decision']=='ACCEPT'
+                if calls.count('comment')==0:
+                    calls.append('comment')
+                    raise TransientFailure('comment transport interrupted')
+
+            def merge(self,*args):
+                calls.append('merge')
+                return {'state':'MERGED'}
+
+            def issue_close(self,issue):
+                calls.append(('close',issue))
+
+        def agent(role,*args,**kwargs):
+            calls.append(role)
+            snapshot={'head_sha':head,'base_sha':base,'blocking_kind':'FIXABLE',
+                      'rationale':'Revisor auditou o diff concreto da tarefa', 'findings':[]}
+            if role=='strategic-reviewer':
+                return dict(snapshot,decision='PASS',alternative='leitura',
+                            opportunity_cost='tempo',north_star_impact='cobertura')
+            if role=='technical-reviewer':
+                if calls.count(role)==1:
+                    raise TransientFailure('reviewer interrupted')
+                return dict(snapshot,decision='ACCEPT',real_evidence=['diff'],tests_assessed=['suite'])
+            if role=='integrator':
+                return dict(snapshot,decision='MERGE')
+            raise AssertionError(role)
+
+        self.runner.scm=Hosting()
+        with (patch.object(self.runner,'_agent',side_effect=agent),
+              patch.object(self.runner,'_delegate_product_tests'),
+              patch.object(self.runner,'_verify',return_value=({'head':head},{}))):
+            with self.assertRaisesRegex(TransientFailure,'reviewer interrupted'):
+                self.runner.run_one(self.task)
+            self.runner=Runner(self.repo,self.root/'state',codex=self.codex,scm=self.runner.scm)
+            with (patch.object(self.runner,'_agent',side_effect=agent),
+                  patch.object(self.runner,'_delegate_product_tests'),
+                  patch.object(self.runner,'_verify',return_value=({'head':head},{}))):
+                with self.assertRaisesRegex(TransientFailure,'comment transport'):
+                    self.runner.run_one(self.task)
+                self.assertEqual(self.runner.run_one(self.task)['state'],'DONE')
+        self.assertEqual(calls[:3],['ci','strategic-reviewer','technical-reviewer'])
+        self.assertEqual(calls.count('strategic-reviewer'),1)
+        self.assertEqual(calls.count('technical-reviewer'),2)
+        self.assertEqual(calls[-3:],['integrator','merge',('close',4)])
+
+    def test_merged_task_with_mismatched_ci_intent_does_not_close_issue(self):
+        head=self.base
+        snapshot={'head_sha':head,'base_sha':self.base,'blocking_kind':'FIXABLE',
+                  'rationale':'Revisão independente verificou o snapshot', 'findings':[]}
+        pair={'pr':5,'head':head,'base':self.base,'round':3,
+              'strategic':dict(snapshot,decision='PASS',opportunity_cost='tempo',
+                               alternative='leitura',north_star_impact='cobertura'),
+              'technical':dict(snapshot,decision='ACCEPT',real_evidence=['diff'],tests_assessed=['suite'])}
+        intent={'pr':5,'head':head,'base':self.base,'ci':{'pr':5,'head':head,'base':'unrelated'}}
+        self.runner.record('0.1.2','INTENT',stage='MERGE_INTENT',issue=4,pr=5,head=head,
+                           review_history=[pair],merge_intent=intent,ci_head=head,review_head=head)
+        with patch.object(self.runner,'scm') as scm:
+            scm.pr.return_value={'state':'MERGED'}
+            with self.assertRaisesRegex(PolicyFailure,'intenção e provas'):
+                self.runner.run_one(self.task)
+            scm.confirm_merge.assert_not_called()
+            scm.issue_close.assert_not_called()
+
+    def test_blocker_plan_cannot_claim_independent_test_changes(self):
+        test=self.work/'tests'/'test_agent_owned.py'
+        test.write_text('raise AssertionError("product test fixture")\n')
+        head=git(self.work,'rev-parse','HEAD')
+        report={'status':'DONE','commit_plan':[{
+            'message':'fix(auditoria): preserve limites do reparo [#0.1.2]',
+            'paths':['tests/test_agent_owned.py']}]}
+        with self.assertRaisesRegex(PolicyFailure,'fora do papel Developer'):
+            self.runner._apply_developer_plan(self.work,'0.1.2',report)
+        self.assertTrue(test.is_file())
+        self.assertEqual(git(self.work,'rev-parse','HEAD'),head)
+        self.assertEqual(git(self.work,'diff','--cached','--name-only'),'')
+
     def test_strategic_stop_without_actionable_findings_requires_diagnosis(self):
         self.runner.record('0.1.2','STOP',stage='BLOCKED',pr=5,
                            review_head=self.base,strategic={'decision':'STOP'},

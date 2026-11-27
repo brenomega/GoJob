@@ -4,8 +4,12 @@ This module does not import the (potentially broken) development runner. It neve
 approves changes, merges PRs, alters candidate records, or bypasses user policy.
 """
 from __future__ import annotations
-import hashlib,json,os,time
+import fcntl,hashlib,json,re,time
+from contextlib import contextmanager
 from pathlib import Path
+from gojob_runner.agent_privacy import report_context
+from gojob_runner.merge_evidence import OID
+from release_package import activate_package, build_package, git_bytes
 try:
     from .recovery_context import gather,prompt_context,private_write,redact
 except ImportError:
@@ -35,7 +39,7 @@ MAX_REPAIR_ATTEMPTS=2
 
 def read_json(path,default):
     try:return json.loads(Path(path).read_text())
-    except (OSError,ValueError):return default
+    except FileNotFoundError:return default
 
 def save_json(path,payload):
     private_write(path,json.dumps(payload,ensure_ascii=False,indent=2,sort_keys=True))
@@ -69,6 +73,9 @@ def triage_event(repo,home,folder,info,*,agent_func,source='supervisor',runner_s
         'git_head':evidence.get('git',{}).get('head'),
         'policies':{k:v.get('sha256') for k,v in evidence.get('documents',{}).items()}},
         sort_keys=True,default=str).encode()).hexdigest()
+    persisted=status.get('decision') or {}
+    if persisted.get('decision') in ('POLICY_STOP','NEEDS_USER'):
+        return persisted,evidence
     same=status.get('semantic_fingerprint')==semantic
     if same and status.get('decision') and not force:return status['decision'],evidence
     # Content changes over time; avoid unlimited fresh calls when no substantive
@@ -101,6 +108,7 @@ def triage_event(repo,home,folder,info,*,agent_func,source='supervisor',runner_s
             raise RuntimeError('Diagnostic omitted cause/evidence/plan')
         if immutable_human_stop(info.get('kind'),info.get('error')):
             result={**result,'decision':'POLICY_STOP','cause':'Nondelegable consent/approval veto: '+str(result.get('cause'))}
+        result=report_context(result)
         status.update({'decision':result,'status':'DIAGNOSED','next_attempt_at':0})
         save_json(folder/'triage.json',result);save_json(folder/'triage_state.json',status)
         return result,evidence
@@ -118,17 +126,57 @@ def repair_allowed(folder,now=None):
     return (int(state.get('attempts',0))<MAX_REPAIR_ATTEMPTS
             and now>=float(state.get('next_attempt_at',0)))
 
+@contextmanager
+def repair_lock(home,repo):
+    common=git_bytes(repo,'rev-parse','--path-format=absolute','--git-common-dir').decode().strip()
+    identity=hashlib.sha256(str(Path(common).resolve()).encode()).hexdigest()[:16]
+    path=Path(home)/'repair-locks'/identity
+    path.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
+    with path.open('a') as lock:
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def incident_key(repo, kind, error):
+    stable=re.sub(r'(?:0x[0-9a-f]+|\bpid[ =:]+\d+|\b\d{4}-\d\d-\d\d[T ][0-9:.+Z-]+)',
+                  '<runtime>',redact(error),flags=re.I)
+    return hashlib.sha256(f'{Path(repo).resolve()}|{kind}|{stable}'.encode()).hexdigest()[:14]
+
+
+def reserve_repair_attempt(folder):
+    if not repair_allowed(folder):
+        return False
+    path=Path(folder)/'repair_attempts.json'
+    old=read_json(path,{'attempts':0,'history':[]})
+    old['attempts']+=1
+    old.setdefault('history',[]).append({'time':time.time(),'status':'STARTED'})
+    old['last_status']='STARTED'
+    old['next_attempt_at']=time.time()+min(10800,600*2**(old['attempts']-1))
+    save_json(path,old)
+    return True
+
+
 def record_repair_attempt(folder,status,error=None):
     path=Path(folder)/'repair_attempts.json'
     old=read_json(path,{'attempts':0,'history':[]})
-    n=old['attempts']+1
-    old['attempts']=n
     old.setdefault('history',[]).append({'time':time.time(),'status':status,'error':redact(error or '')[:800]})
     old['last_status']=status
-    # Future cycles retry, but never perpetually and never in a tight loop.
-    old['next_attempt_at']=0 if status=='SUCCEEDED' else time.time()+min(10800,600*2**(n-1))
+    if status=='SUCCEEDED':
+        old['next_attempt_at']=0
     save_json(path,old)
     return old
+
+
+def repair_authorized(diagnosis):
+    evidence=diagnosis.get('evidence')
+    return (diagnosis.get('decision')=='REPAIR_RUNNER'
+            and isinstance(evidence,list) and any(isinstance(item,str) and item.strip() for item in evidence)
+            and all(isinstance(diagnosis.get(key),str) and diagnosis[key].strip() for key in ('cause','plan')))
+
 
 def proactive_review(repo,home,*,agent_func,runner_sha,minimum_interval=86400):
     """Daily best-effort risk hunt, never turns speculation into an automatic merge."""
@@ -158,6 +206,7 @@ def proactive_review(repo,home,*,agent_func,runner_sha,minimum_interval=86400):
         if out.get('decision')=='REPAIR_RUNNER':
             if out.get('priority') not in ('critical','high') or not out.get('evidence') or not out.get('reproduction'):
                 out['decision']='FOLLOW_UP'
+        out=report_context(out)
         save_json(incident_folder/'proactive_report.json',out)
         save_json(where/'state.json',{'last_scan':time.time(),'runner_sha':runner_sha,
                                     'status':out['decision'],'report_dir':str(incident_folder)})
@@ -167,61 +216,92 @@ def proactive_review(repo,home,*,agent_func,runner_sha,minimum_interval=86400):
                                     'status':'UNAVAILABLE','error':redact(e)[:500]})
         return {'status':'UNAVAILABLE','reason':redact(e)[:350]}
 
-def promote_approved_supervisor(repo,home,expected_merge=None):
-    """Deploy independently reviewed, merged supervisor code with a canary and rollback.
+def promote_approved_supervisor(repo,home,expected_merge):
+    """Activate one complete, canary-checked generation from the approved merge."""
+    expected=expected_merge.get('oid') if isinstance(expected_merge,dict) else expected_merge
+    if not isinstance(expected,str) or not OID.fullmatch(expected):
+        raise ValueError('Promoção exige o SHA completo do merge aprovado')
+    git_bytes(repo,'fetch','origin','refs/heads/develop:refs/remotes/origin/develop')
+    if len(git_bytes(repo,'show','-s','--format=%P',expected).split())!=2:
+        raise ValueError('Promoção exige um merge commit de dois pais')
+    if git_bytes(repo,'merge-base',expected,'origin/develop').decode().strip()!=expected:
+        raise ValueError('Merge aprovado não está integrado em develop')
+    active=Path(home)/'stable'
+    if active.is_symlink():
+        current=active.resolve().parents[1].name
+        if OID.fullmatch(current) and current!=expected:
+            if git_bytes(repo,'merge-base',expected,current).decode().strip()==expected:
+                raise ValueError('Geração ativa descende do merge solicitado; preservar instalação mais recente')
+    package=build_package(repo,expected,Path(home)/'supervisor-generations')
+    changed=activate_package(home,package)
+    return {'status':'DEPLOYED' if changed else 'ALREADY_CURRENT',
+            'version':(package/'RUNNER_VERSION').read_text().strip(),'commit':expected,
+            'package':str(package)}
 
-    Never deploys from an unmerged branch. The caller must have already verified
-    PR review, CI and merge in the existing repair transaction. No code from
-    the product checkout is executed for deployment verification.
-    """
-    import shutil,subprocess,sys,tempfile
-    repo=Path(repo).resolve();home=Path(home).resolve()
-    target=home/'stable'
-    if not (target/'stable_supervisor.py').is_file():
-        return {'status':'NO_INSTALLED_STABLE'}
-    def git_show(ref):
-        r=subprocess.run(['git','show','origin/develop:'+ref],cwd=repo,capture_output=True,timeout=25)
-        if r.returncode:raise RuntimeError('Merged supervisor file missing: '+ref)
-        return r.stdout
-    p=subprocess.run(['git','fetch','origin','develop'],cwd=repo,text=True,capture_output=True,timeout=120)
-    if p.returncode:raise RuntimeError('Cannot fetch merged supervisor for canary deployment')
-    head=subprocess.run(['git','rev-parse','origin/develop'],cwd=repo,capture_output=True,text=True,timeout=20)
-    if head.returncode:raise RuntimeError('Cannot confirm target commit')
-    expected=(expected_merge.get('oid') if isinstance(expected_merge,dict) else expected_merge)
-    if expected and head.stdout.strip()!=expected:
-        raise RuntimeError('Develop moved after reviewed merge; preserve and revalidate SHA before deployment')
-    paths={name:'automation/supervisor/'+name for name in
-           ('stable_supervisor.py','recovery_context.py','recovery_dispatch.py','rescue_watchdog.py','schema_protocol.py')}
-    source={name:git_show(path) for name,path in paths.items()}
-    version=git_show('RUNNER_VERSION').decode().strip()
-    with tempfile.TemporaryDirectory(prefix='gojob-supervisor-canary-',dir=home) as tmp:
-        stage=Path(tmp)
-        for name,content in source.items():
-            (stage/name).write_bytes(content)
-        for name in ('stable_supervisor.py','rescue_watchdog.py'):
-            r=subprocess.run([sys.executable,'-B',str(stage/name),'--help'],cwd=stage,
-                             text=True,capture_output=True,timeout=20)
-            if r.returncode:raise RuntimeError('Canary supervisor failed: '+name+': '+r.stderr[-250:])
-        backup=target/'last-known-good'
-        backup.mkdir(parents=True,exist_ok=True,mode=0o700)
-        originals={name:(target/name).read_bytes() if (target/name).exists() else None for name in source}
-        if all(originals.get(name)==content for name,content in source.items()):
-            return {'status':'ALREADY_CURRENT','version':version}
-        # Make all backups first. No change to systemd units or Git metadata.
-        for name,content in originals.items():
-            if content is not None:private_write(backup/name,content.decode('utf-8'))
-        installed=[]
+
+def run_incident_repair(repo, home, folder, info, diagnosis, repair, *, claim=None):
+    """Reserve the shared budget before handing off to an agent or writing remotely."""
+    if immutable_human_stop(info.get('kind'),info.get('error')):
+        return {'status':'POLICY_STOP'}
+    if not repair_authorized(diagnosis):
+        decision=diagnosis.get('decision')
+        return {'status':'INSUFFICIENT_REPAIR_EVIDENCE' if decision=='REPAIR_RUNNER'
+                else decision or 'UNCLASSIFIED'}
+    folder=Path(folder)
+    with repair_lock(home,repo) as acquired:
+        if not acquired:
+            return {'status':'REPAIR_BUSY','incident':info['id']}
+        if (folder/'deployment.json').is_file():
+            return {'status':'REPAIR_ALREADY_DEPLOYED','incident':info['id']}
+        journal=Path(home)/'repairs'/(info['id']+'-review-history.json')
+        pending=read_json(journal,{})
+        if pending.get('needs_user'):
+            return {'status':'NEEDS_USER','incident':info['id']}
+        approval=read_json(folder/'repair.json',None)
+        if approval:
+            oid=approval.get('merge')
+            oid=oid.get('oid') if isinstance(oid,dict) else oid
+            if not oid or pending.get('merge_confirmed')!=oid:
+                return {'status':'NEEDS_USER','incident':info['id'],
+                        'reason':'Reconciliar aprovação anterior com journal e prova de merge'}
+        resuming=bool(approval or pending.get('merge_intent'))
+        if not resuming and not repair_allowed(folder):
+            return {'status':'REPAIR_COOLDOWN_OR_EXHAUSTED','incident':info['id']}
+        if claim is not None and not claim():
+            return {'status':'DIAGNOSED_REPAIR_LIMIT_REACHED','incident':info['id']}
+        if not resuming and not reserve_repair_attempt(folder):
+            return {'status':'REPAIR_COOLDOWN_OR_EXHAUSTED','incident':info['id']}
         try:
-            for name,content in source.items():
-                private_write(target/name,content.decode('utf-8'))
-                installed.append(name)
-            result=subprocess.run([sys.executable,'-B',str(target/'stable_supervisor.py'),'--help'],
-                                  cwd=target,text=True,capture_output=True,timeout=20)
-            if result.returncode:raise RuntimeError('Installed supervisor canary failed')
-        except Exception:
-            for name in installed:
-                previous=originals.get(name)
-                if previous is None:(target/name).unlink(missing_ok=True)
-                else:private_write(target/name,previous.decode('utf-8'))
-            raise
-        return {'status':'DEPLOYED','version':version,'files':list(source)}
+            if approval is None:
+                approval=repair(repo,home,info['id'],info)
+                save_json(folder/'repair.json',approval)
+            deployed=promote_approved_supervisor(repo,home,expected_merge=approval['merge'])
+            save_json(folder/'deployment.json',deployed)
+            record_repair_attempt(folder,'SUCCEEDED')
+            (folder/'repair.failed').unlink(missing_ok=True)
+            return {'status':'REPAIRED','result':approval,'deployment':deployed,'attempted':True}
+        except Exception as exc:
+            error=redact(type(exc).__name__+': '+str(exc))
+            record_repair_attempt(folder,'FAILED',error)
+            private_write(folder/'repair.failed',error)
+            return {'status':'REPAIR_FAILED','error':error[:500],'incident':info['id'],'attempted':True}
+
+
+def resume_pending_repairs(repo,home,repair):
+    """Reconcile remote operations even after the condition that triggered them disappears."""
+    repo=Path(repo).resolve()
+    home=Path(home)
+    for folder in sorted((home/'incidents').glob('*/')):
+        if (folder/'deployment.json').exists():
+            continue
+        info=read_json(folder/'incident.json',{})
+        if info.get('repo') != str(repo) or info.get('id') != folder.name:
+            continue
+        journal=home/'repairs'/f'{folder.name}-review-history.json'
+        state=read_json(journal,{})
+        if state.get('needs_user') or not state.get('merge_intent'):
+            continue
+        diagnosis=read_json(folder/'triage.json',{})
+        if repair_authorized(diagnosis):
+            return run_incident_repair(repo,home,folder,info,diagnosis,repair)
+    return None
