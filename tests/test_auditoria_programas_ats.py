@@ -32,10 +32,38 @@ EDICOES_VERAO = {
     "prio-summer-2027", "opportunity-summer-2027", "btg-ferias-2027-01",
     "visagio-summer-2027", "moove-summer-2027", "napratica-6098153004",
 }
-# O IAG liga ao formulário da Quantum. Os editais identificam a vaga 4 da
-# AgeRio e a vaga 326670 do Banco Central, também listada na Super Estágios.
+# O edital Tech.AI identifica a campanha Blip. O blog Icatu e a 99jobs
+# identificam a mesma edição. Os anúncios Gupy distinguem Petros, TIM, PRIO
+# regular, PRIO verão e Opportunity. O IAG liga ao formulário da Quantum.
+# Os editais identificam a vaga 4 da AgeRio e a vaga 326670 do Banco
+# Central, também listada na Super Estágios.
 # Visagio e Moove ligam aos anúncios de suas respectivas edições de verão.
 PUBLICACOES_VERIFICADAS = {
+    "blip-tech-ai-2027": {
+        "fonte_empregador": "https://estagio.blip.ai",
+    },
+    "icatu-2027-1": {
+        "fonte_legado": (
+            "https://www.99jobs.com/icatu-seguros/jobs/518242-programa-de-estagio-icatu-seguros-2027-1"
+        ),
+        "fonte_empregador": "https://blog.icatuseguros.com.br/institucional/programa-estagio-icatu",
+    },
+    "petros-12891329": {
+        "fonte_legado": "https://petros.gupy.io/jobs/12891329",
+    },
+    "tim-stem-2026": {
+        "fonte_legado": "https://programadeestagiostem.gupy.io",
+    },
+    "prio-estagio-2027": {
+        "fonte_legado": "https://programadeestagioprio.gupy.io",
+    },
+    "prio-summer-2027": {
+        "fonte_legado": "https://prio.gupy.io/jobs/12080177",
+    },
+    "opportunity-summer-2027": {
+        "fonte_legado": "https://opportunity.gupy.io/jobs/12463497",
+        "fonte_empregador": "https://www.opportunity.com.br/summerjob/Index",
+    },
     "sezzle-7541130003": {
         "fonte_outro_ats": "https://job-boards.greenhouse.io/sezzle/jobs/7541130003",
     },
@@ -173,6 +201,16 @@ class AuditoriaProgramasATS(unittest.TestCase):
                     ids_com_as_fontes, {id_vaga}, "publicação atribuída a mais de um ID"
                 )
 
+    def test_card_da_ada_permanece_como_evidencia_complementar_da_blip(self):
+        # Na revalidação de 28/11, o índice mostrou o nome do programa sem
+        # confirmar o destino do card para a edição de 2027.
+        blip = self.por_id["blip-tech-ai-2027"]
+        links = {
+            identidade_da_url(url.strip())
+            for url in blip["evidencia_complementar"].split("|")
+        }
+        self.assertIn("https://ada.tech/talentos", links)
+
     def test_vagas_com_preserva_ids_e_datas_da_evidencia_complementar(self):
         revalidacao = re.search(
             r"^### Vagas\.com[^\n]*28/11/2026[^\n]*\n\n([^\n]+)",
@@ -262,13 +300,3 @@ class AuditoriaProgramasATS(unittest.TestCase):
                                      (len(ids), len(ids - anteriores), len(ids - outras)))
                 anteriores.update(ids)
             self.assertEqual(anteriores, {linha["id"] for linha in recorte})
-
-        # A edição Icatu aparece em duas rotas. A Blip amplia o recorte vigente.
-        rotas_de_casos = {
-            "icatu-2027-1": {"fonte_legado", "fonte_empregador"},
-            "blip-tech-ai-2027": {"fonte_empregador"},
-        }
-        for id_vaga, fontes in rotas_de_casos.items():
-            with self.subTest(id=id_vaga):
-                self.assertEqual({campo for campo in ROTAS.values() if self.por_id[id_vaga][campo]},
-                                 fontes)
