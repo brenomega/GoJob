@@ -84,7 +84,10 @@ class ReleasePackageTests(unittest.TestCase):
             start = service_execution.monotonic_us()
             source = previous or (self.home/'stable').resolve().parents[1]
             with patch.dict('os.environ', {'INVOCATION_ID': identity}):
-                service_execution.report_completion(self.home, unit.removesuffix('.service'), source)
+                service_execution.report_completion(
+                    self.home, unit.removesuffix('.service'), source,
+                    runner_sha=(service_execution.verify_package(source)['commit']
+                                if unit.startswith('gojob-runner-supervisor') else None))
             ended = service_execution.monotonic_us()
             statuses[unit] = (f'Result=success\nInvocationID=\nExecMainPID={service_execution.os.getpid()}\n'
                               f'ExecMainStartTimestampMonotonic={start}\nExecMainExitTimestampMonotonic={ended}')

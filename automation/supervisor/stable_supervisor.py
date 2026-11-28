@@ -14,7 +14,7 @@ if __name__ == '__main__':
 from gojob_runner import VERSION
 from gojob_runner.agent_privacy import agent_env, redact
 from gojob_runner.review_policy import MAX_REVIEW_ROUNDS, collect_reviews, disposition, review_feedback
-from gojob_runner.tools import GitHub, MergeProtectionRequired, apply_commit_plan, worktree_changes
+from gojob_runner.tools import GitHub, MergeProtectionRequired, VerifiedCIFailure, apply_commit_plan, worktree_changes
 from gojob_runner.merge_evidence import reconcile_merge
 from service_execution import boot_id, monotonic_us, report_completion
 try:
@@ -237,7 +237,12 @@ def repair(repo,home,inc,info):
         raise RuntimeError('Checkpoint de incidente pertence a outro HEAD/base')
     issue=issue_for_incident(folder,inc,info['error'])
     count=int(git(folder,'rev-list','--count',f'{base}..HEAD'))
-    if count==0:
+    pending_review = (history['rounds'][-1] if history['rounds'] else None)
+    pending_repair = (pending_review is not None
+        and repair_review_decision(pending_review['strategic'],pending_review['technical']) == 'REPAIR'
+        and pending_review['head'] == git(folder,'rev-parse','HEAD')
+        and not pending_review.get('repair'))
+    if count==0 or pending_repair:
         previous=history['rounds'][-1] if history['rounds'] else None
         feedback=(json.dumps(review_feedback(previous['strategic'],previous['technical']),ensure_ascii=False)[:16000]
                   if previous else '')
@@ -259,6 +264,8 @@ def repair(repo,home,inc,info):
             raise RuntimeError('Implementador do autorreparo não concluiu: '+str(outcome.get('summary',''))[:350])
         if git(folder,'status','--porcelain'):
             apply_repair_commit_plan(folder,outcome)
+    if git(folder,'status','--porcelain'):
+        raise RuntimeError('Autorreparo com alterações não commitadas; preservar antes de publicar')
     head=git(folder,'rev-parse','HEAD')
     if head==base:raise RuntimeError('Autorreparo sem alterações')
     impact=infer_impact(old,(folder/'RUNNER_VERSION').read_text())
@@ -301,7 +308,37 @@ def repair(repo,home,inc,info):
             if not earlier.get('repair'):
                 earlier['repair']={'status':'RECOVERED_FROM_GIT','head':head,'timestamp':time.time()}
                 atomic_json(journal,history)
-        proof=wait_ci(folder,pr,head,base,branch)
+        try:
+            proof=wait_ci(folder,pr,head,base,branch)
+        except VerifiedCIFailure as failure:
+            attempts=history.setdefault('ci_repair_attempts',{})
+            used=int(attempts.get(head,0))
+            if used>=2:
+                raise RuntimeError('CI vermelho persiste após duas correções; preservar incidente') from failure
+            if git(folder,'status','--porcelain'):
+                raise RuntimeError('CI falhou com diff não commitado; preservar para reconciliação') from failure
+            if 8-int(git(folder,'rev-list','--count',f'{base}..HEAD'))<1:
+                raise RuntimeError('Orçamento de commits esgotado durante recuperação de CI') from failure
+            attempts[head]=used+1
+            atomic_json(journal,history)
+            ci_report={'status':'CI_FAILED','head':head,'base':base,'evidence':getattr(failure,'evidence',{})}
+            prompt=('REPAIR IMPLEMENTER. Verified GitHub Actions CI failure for runner-only PR. '
+                    'Read the exact run and failing steps. Fix the causal defect, preserve all prior work. '
+                    'Write a regression test. Do not touch product or perform git writes. '
+                    'Return a commit_plan and DONE only after local checks. '
+                    +json.dumps(ci_report,ensure_ascii=False)[:12000])
+            answer=agent(folder,prompt,schema,write=True,timeout=2100)
+            if answer.get('status')!='DONE':
+                raise RuntimeError('CI repair agent did not complete; preserve report')
+            assert_repair_index(folder)
+            if not git(folder,'status','--porcelain'):
+                raise RuntimeError('CI repair made no code changes')
+            apply_repair_commit_plan(folder,answer,8-int(git(folder,'rev-list','--count',f'{base}..HEAD')))
+            if git(folder,'status','--porcelain'):
+                raise RuntimeError('CI repair left uncommitted files; do not publish')
+            validate_repair(folder,base,old,impact)
+            git(folder,'push','origin',branch,timeout=240)
+            continue
         pr_fence(head)
         previous=history['rounds'][-1] if history['rounds'] else None
         if previous and previous['head']==head:
@@ -596,7 +633,7 @@ def main(argv=None):
                         try:proactive_cycle(repo,home,runner_sha,allow_repair=remaining>0,claim=claim)
                         except Exception as exc:
                             handle(str(exc),'proactive_scan_error',exit_code=0)
-                        report_completion(home,'gojob-runner-supervisor',SOURCE_ROOT)
+                        report_completion(home,'gojob-runner-supervisor',SOURCE_ROOT,runner_sha=runner_sha)
                         return 0
                     error=redact(result.stderr or result.stdout or 'runner exit='+str(rc))
                     if rc==75 and cycle<args.max_repairs:

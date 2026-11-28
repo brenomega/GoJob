@@ -102,6 +102,7 @@ def execution_proof(name, home, merge, switched_at):
                           'ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic')
     observed = json.loads(receipt.read_text())
     if (status.get('Result') == 'success' and observed.get('commit') == merge
+        and (name != 'gojob-runner-supervisor' or observed.get('runner_sha') == merge)
         and matches_execution(observed, status)
         and int(status['ExecMainStartTimestampMonotonic']) >= switched_at):
         return observed['invocation_id']

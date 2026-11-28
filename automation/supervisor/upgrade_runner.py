@@ -89,6 +89,49 @@ def prior_candidate(repo):
     return redact(f'PR #13, candidato não aprovado, SHA {sha}.\n{commits}\n{paths}')[:6500]
 
 
+def repair_committed_gate_failure(repo, corrected, row, ledger, journal, scope):
+    # Diagnose gate failure once per SHA instead of replaying an identical failure.
+    if row.get('ci_failure'):
+        return corrected
+    previous=load(journal,{})
+    intent=previous.get('gate_repair_intent')
+    if intent:
+        recovered=resume_commits(repo,EAP,intent,**scope)
+        gates(repo)
+        return recovered
+    try:
+        gates(repo)
+        return corrected
+    except TransientFailure:
+        raise
+    except ExternalFailure as exc:
+        previous=load(journal,{})
+        used=int(previous.get('gate_repair_attempts',0))
+        if used>=2:
+            raise ValueError('Gate local falhou após duas tentativas documentadas; diagnosticar, sem loop') from exc
+        left=8-int(git(repo,'rev-list','--count',f"{row['base']}..HEAD"))
+        if left<1:
+            raise ValueError('Gate falhou sem orçamento de commit; preservar') from exc
+        previous.update(gate_repair_attempts=used+1,gate_failure=redact(str(exc))[:1600])
+        atomic_json(journal,previous)
+        schema=repo/'automation/gojob_runner/schemas/developer.json'
+        evidence={'local_gate_failure':previous['gate_failure'],'head':corrected,
+                  'review':review_feedback(row['strategic'],row['technical']) if not row.get('ci_failure') else {}}
+        outcome=recover_implementer(repo,row['base'],corrected,evidence,
+                {'status':'BLOCKED','summary':previous['gate_failure']},schema=schema,
+                ledger=ledger,eap=EAP,round_number=row['round'],
+                ci_failure={'failed_local_gate':previous['gate_failure']},remaining_commits=left)
+        # Validate the corrected working tree BEFORE committing, including tests.
+        gates(repo)
+        scope={**scope,'max_commits':left}
+        intent=repair_intent(repo,corrected,EAP,outcome,**scope)
+        previous['gate_repair_intent']=intent
+        atomic_json(journal,previous)
+        recovered=resume_commits(repo,EAP,intent,**scope)
+        gates(repo)
+        return recovered
+
+
 def implement(repo, row, ledger):
     head, base, number = row['head'], row['base'], row['round']
     ci_failure = row.get('ci_failure')
@@ -99,9 +142,7 @@ def implement(repo, row, ledger):
     scope = {'allowed_prefixes': SOURCE_PREFIXES, 'allowed_files': REPAIR_FILES, 'max_commits': remaining}
     if attempt.get('commit_intent'):
         corrected = resume_commits(repo, EAP, attempt['commit_intent'], **scope)
-        if not ci_failure:
-            gates(repo)
-        return corrected
+        return repair_committed_gate_failure(repo,corrected,row,ledger,journal,scope)
     staged, dirty = worktree_changes(repo)
     if (staged or git(repo, 'rev-parse', 'HEAD') != head
         or any(not release_scope(path) for path in dirty)):
@@ -142,6 +183,23 @@ def implement(repo, row, ledger):
                                      remaining_commits=remaining)
         report = {'status': report['status'], 'commit_plan': report.get('commit_plan')}
         atomic_json(journal, {'state': 'REPORTED', 'report': report})
+    if not ci_failure:
+        try:
+            gates(repo)
+        except TransientFailure:
+            raise
+        except ExternalFailure as exc:
+            # A candidate with a deterministic failing gate stays in REPAIRING.
+            if attempt.get('precommit_gate_repair'):
+                raise ValueError('Gate ainda falhou após reparo, preserve incidente') from exc
+            attempt['precommit_gate_repair']=redact(str(exc))[:1400]
+            atomic_json(journal,attempt)
+            report=recover_implementer(repo,base,head,feedback,
+                {'status':'BLOCKED','summary':attempt['precommit_gate_repair']},
+                schema=schema,ledger=ledger,eap=EAP,round_number=number,
+                ci_failure={'failed_local_gate':attempt['precommit_gate_repair']},
+                remaining_commits=remaining)
+            gates(repo)
     intent = repair_intent(repo, head, EAP, report, **scope)
     if ci_failure:
         try:
@@ -154,9 +212,7 @@ def implement(repo, row, ledger):
             raise
     atomic_json(journal, {'state': 'COMMITTING', 'commit_intent': intent})
     corrected = resume_commits(repo, EAP, intent, **scope)
-    if not ci_failure:
-        gates(repo)
-    return corrected
+    return repair_committed_gate_failure(repo,corrected,row,ledger,journal,scope)
 
 
 def resume_correction(repo, scm, pr, base, state, path, ledger, *, recheck_ci=False):
@@ -316,11 +372,12 @@ def finish_merge(scm, state, path, *, revalidate_protection=False):
     if (validate_reviews(state['rounds'][-1], head, base, pr).action != 'ACCEPT'
         or any(intent['ci'].get(key) != intent[key] for key in ('pr', 'head', 'base'))):
         raise ValueError('Intenção de merge sem provas para o snapshot')
+    if revalidate_protection:
+        # Check permissions before GitHub side-effects, including open PRs.
+        scm.require_merge_protection(intent['ci'])
     remote = scm.pr(pr)
     if not state.get('merge_confirmed') and remote.get('state') == 'OPEN':
         remote = scm.merge(pr, BRANCH, head, base)
-    elif revalidate_protection:
-        scm.require_merge_protection(intent['ci'])
     merge = scm.confirm_merge(remote, BRANCH, head, base)
     if git(scm.repo, 'show', f'{merge}:RUNNER_VERSION').strip() != VERSION:
         raise ValueError('Versão do merge difere da release')
@@ -342,7 +399,11 @@ def upgrade_once(repo, ledger):
         raise ValueError('Journal pertence a outra versão')
     if state.get('merge_intent'):
         try:
-            return finish_merge(scm, state, journal)
+            intent = state['merge_intent']
+            authorization = state.get('merge_authorization', {})
+            return finish_merge(scm, state, journal,
+                revalidate_protection=(authorization.get('head') == intent.get('head')
+                    and authorization.get('pr') == intent.get('pr')))
         except VerifiedCIFailure:
             state.setdefault('superseded_merge_intents', []).append(state.pop('merge_intent'))
             atomic_json(journal, state)
@@ -442,12 +503,35 @@ def upgrade(repo, *, ledger=None):
     return upgrade_once(Path(repo).resolve(), ledger)
 
 
-def resume_protected_merge(repo, ledger, head):
+def authorize_protected_merge(repo, ledger, head):
+    # Persist authorization for the exact PR/HEAD/BASE before the remote merge.
     path = ledger.home/'release-worktrees'/f'{VERSION}-review-cycle.json'
     state = load(path, {})
     intent = state.get('merge_intent', {})
     if state.get('version') != VERSION or intent.get('head') != head:
         raise ValueError('SHA autorizado difere da intenção de merge da release')
+    if validate_reviews(state['rounds'][-1],head,intent['base'],intent['pr']).action != 'ACCEPT':
+        raise ValueError('Retomada de merge sem revisão aprovada')
+    scm = GitHub(Path(repo).resolve())
+    scm.verify_identity()
+    scm.require_merge_protection(intent['ci'])
+    approved={'head':head,'pr':intent['pr'],'base':intent['base']}
+    if state.get('merge_authorization',approved) != approved:
+        raise ValueError('Autorização diverge da intenção de merge')
+    state['merge_authorization']=approved
+    atomic_json(path,state)
+    return approved
+
+
+def resume_protected_merge(repo, ledger, head):
+    path = ledger.home/'release-worktrees'/f'{VERSION}-review-cycle.json'
+    state = load(path, {})
+    intent = state.get('merge_intent', {})
+    auth = state.get('merge_authorization', {})
+    if (state.get('version') != VERSION or intent.get('head') != head
+        or auth.get('head') != head or auth.get('pr') != intent.get('pr')
+        or auth.get('base') != intent.get('base')):
+        raise ValueError('Autorização durável difere da intenção exata de merge')
     scm = GitHub(Path(repo).resolve())
     scm.verify_identity()
     return finish_merge(scm, state, path, revalidate_protection=True)

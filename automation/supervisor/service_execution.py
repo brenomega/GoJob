@@ -35,12 +35,18 @@ def matches_execution(record, status):
         return False
 
 
-def report_completion(home, role, source):
+def report_completion(home, role, source, *, runner_sha=None):
     identity = invocation_id(os.environ.get('INVOCATION_ID'))
     if not identity or not (source/'manifest.json').is_file():
         return
     commit = verify_package(source)['commit']
-    atomic_json(Path(home)/'service-executions'/f'{role}.json', {
+    receipt = {
         'commit': commit, 'invocation_id': identity, 'pid': os.getpid(),
         'boot_id': boot_id(), 'observed_at': monotonic_us(),
-    })
+    }
+    if role == 'gojob-runner-supervisor':
+        # Package identity cannot attest the runner loaded from develop.
+        if not isinstance(runner_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', runner_sha):
+            raise RuntimeError('Recibo sem SHA do runner realmente executado')
+        receipt['runner_sha'] = runner_sha
+    atomic_json(Path(home)/'service-executions'/f'{role}.json', receipt)

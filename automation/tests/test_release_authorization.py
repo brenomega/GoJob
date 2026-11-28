@@ -121,10 +121,11 @@ class ReleaseAuthorizationTests(unittest.TestCase):
             self.assertEqual(release_worker.once(self.root, ledger=self.ledger,
                                                 resume_merge_protection=head)['status'], 'INSTALLED')
         write.assert_called_once_with('pr', 'merge', '15', '--merge', '--match-head-commit', head)
-        self.assertEqual(ci.call_count, 2)
+        self.assertEqual(ci.call_count, 1)  # no CI call before protection is authorized
         current = json.loads(path.read_text())
         self.assertEqual(current['rounds'], rounds)
         self.assertEqual(current['merge_intent'], intent)
+        self.assertEqual(current['merge_authorization'], {'head':head,'pr':15,'base':base})
 
     def test_release_context_filters_reports_logs_and_agent_environment(self):
         with patch.dict(os.environ, {'GOJOB_RUNNER_TELEGRAM_BOT_TOKEN': 'synthetic-bot-value',

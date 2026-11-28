@@ -41,7 +41,7 @@ def install_release_worker(repo, source_sha, *, enable=True, home=None, units=No
 
 def once(repo, *, ledger=None, units=None, resume_merge_protection=None):
     from quickstart import enable_automation
-    from upgrade_runner import resume_protected_merge, upgrade
+    from upgrade_runner import authorize_protected_merge, resume_protected_merge, upgrade
 
     ledger = ledger or ReleaseLedger(VERSION)
     with ledger.exclusive() as acquired:
@@ -66,8 +66,10 @@ def once(repo, *, ledger=None, units=None, resume_merge_protection=None):
             return {'status': 'COOLDOWN', 'next_due_at': retry['next_due_at']}
         try:
             if resume_merge_protection:
-                result = resume_protected_merge(repo, ledger, resume_merge_protection)
+                # Persist authorization before the potentially committed GitHub operation.
+                authorize_protected_merge(repo, ledger, resume_merge_protection)
                 ledger.confirm_protected_merge_resume(resume_merge_protection)
+                result = resume_protected_merge(repo, ledger, resume_merge_protection)
                 retry_file.unlink(missing_ok=True)
             else:
                 result = upgrade(repo, ledger=ledger)
