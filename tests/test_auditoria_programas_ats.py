@@ -32,6 +32,26 @@ EDICOES_VERAO = {
     "prio-summer-2027", "opportunity-summer-2027", "btg-ferias-2027-01",
     "visagio-summer-2027", "moove-summer-2027", "napratica-6098153004",
 }
+# A campanha Visagio encaminha aos dois anúncios Gupy da mesma edição.
+# O anúncio Mappit é o destino de inscrição da campanha Moove de 2027.
+PUBLICACOES_VERIFICADAS = {
+    "sezzle-7541130003": {
+        "fonte_outro_ats": "https://job-boards.greenhouse.io/sezzle/jobs/7541130003",
+    },
+    "visagio-summer-2027": {
+        "fonte_legado": "https://visagio.gupy.io/jobs/12639446",
+        "fonte_empregador": "https://www.visagio.com/vagas/summer-job2027",
+    },
+    "moove-summer-2027": {
+        "fonte_outro_ats": "https://mappit.com.br/jobs/summer-job-moove-sao-paulo/blnup10bxl32anrt9okfyqgd0",
+        "fonte_empregador": "https://summerjobmoovelub.com",
+    },
+}
+
+
+def identidade_da_url(url):
+    # Nas publicações verificadas, a identidade está no domínio e no caminho.
+    return urlsplit(url)._replace(query="", fragment="").geturl().rstrip("/")
 
 
 class AuditoriaProgramasATS(unittest.TestCase):
@@ -104,6 +124,26 @@ class AuditoriaProgramasATS(unittest.TestCase):
             with self.subTest(id=id_vaga):
                 self.assertEqual({campo: self.por_id[id_vaga][campo] for campo in campos}, campos)
 
+    def test_rotas_apontam_para_publicacoes_da_vaga_ou_edicao(self):
+        fontes_por_id = {
+            linha["id"]: {
+                campo: identidade_da_url(linha[campo])
+                for campo in ROTAS.values() if linha[campo]
+            }
+            for linha in self.linhas
+        }
+        for id_vaga, fontes_esperadas in PUBLICACOES_VERIFICADAS.items():
+            with self.subTest(id=id_vaga):
+                self.assertEqual(fontes_por_id[id_vaga], fontes_esperadas)
+                urls_esperadas = set(fontes_esperadas.values())
+                ids_com_as_fontes = {
+                    outro_id for outro_id, fontes in fontes_por_id.items()
+                    if urls_esperadas.intersection(fontes.values())
+                }
+                self.assertEqual(
+                    ids_com_as_fontes, {id_vaga}, "publicação atribuída a mais de um ID"
+                )
+
     def test_verao_preserva_edicoes_controles_e_prazo_divergente(self):
         self.assertEqual(
             {linha["id"] for linha in self.publicas if linha["tipo"] == "SUMMER"},
@@ -121,6 +161,16 @@ class AuditoriaProgramasATS(unittest.TestCase):
         for prazo in ("23/10/2026", "27/10/2026"):
             self.assertIn(prazo, opportunity["evidencia"])
 
+        visagio = self.por_id["visagio-summer-2027"]
+        self.assertEqual(visagio["area"], "TRILHA_TI")
+        self.assertEqual(visagio["geografia"], "FORA_ESCOPO")
+        self.assertEqual(visagio["situacao"], "ENCERRADA")
+        self.assertEqual(visagio["prazo_inscricao"], "")
+        self.assertEqual(
+            identidade_da_url(visagio["evidencia_complementar"]),
+            "https://visagio.gupy.io/jobs/12615681",
+        )
+
     def test_tabela_publicada_reconcilia_incidencias_de_cada_rota(self):
         tabela = {}
         denominadores = None
@@ -137,6 +187,8 @@ class AuditoriaProgramasATS(unittest.TestCase):
         recortes = (self.publicas, self.recorte, self.vigentes)
         self.assertEqual(denominadores, [len(recorte) for recorte in recortes])
         self.assertEqual(tabela.keys(), ROTAS.keys())
+        self.assertEqual(tabela["Famílias do legado"][0], (14, 14, 11))
+        self.assertEqual(tabela["Empregador"][0], (7, 3, 2))
         for rota, colunas in tabela.items():
             self.assertEqual(len(colunas), len(recortes), rota)
         for indice, recorte in enumerate(recortes):
