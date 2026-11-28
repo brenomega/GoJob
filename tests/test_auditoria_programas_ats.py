@@ -32,11 +32,31 @@ EDICOES_VERAO = {
     "prio-summer-2027", "opportunity-summer-2027", "btg-ferias-2027-01",
     "visagio-summer-2027", "moove-summer-2027", "napratica-6098153004",
 }
-# A campanha Visagio encaminha aos dois anúncios Gupy da mesma edição.
-# O anúncio Mappit é o destino de inscrição da campanha Moove de 2027.
+# O IAG liga ao formulário da Quantum. Os editais identificam a vaga 4 da
+# AgeRio e a vaga 326670 do Banco Central, também listada na Super Estágios.
+# Visagio e Moove ligam aos anúncios de suas respectivas edições de verão.
 PUBLICACOES_VERIFICADAS = {
     "sezzle-7541130003": {
         "fonte_outro_ats": "https://job-boards.greenhouse.io/sezzle/jobs/7541130003",
+    },
+    "quantum-estagio-produtos": {
+        "fonte_empregador": "https://quantumfinance.com.br/processo-seletivo-estagio-produtos",
+        "fonte_institucional": "https://iag.puc-rio.br/carreira",
+    },
+    "agerio-2026-1-4": {
+        "fonte_institucional": (
+            "https://www.agerio.com.br/wp-content/uploads/2025/11/"
+            "EDITAL-PROCESSO-SELETIVO_ESTAGIO-2026.1-Cronograma-Modificado.pdf"
+        ),
+    },
+    "bcb-pepp-2026-2-rj": {
+        "fonte_outro_ats": (
+            "https://www.superestagios.com.br/index/processoSeletivo/exibe_vagas_banco_brasil.php"
+        ),
+        "fonte_institucional": (
+            "https://www.bcb.gov.br/content/publicacoes/publicacoes_docs/estagio/"
+            "Chamada_PEPP_2026-02%20-%20prorroga%C3%A7%C3%A3o.pdf"
+        ),
     },
     "visagio-summer-2027": {
         "fonte_legado": "https://visagio.gupy.io/jobs/12639446",
@@ -111,8 +131,12 @@ class AuditoriaProgramasATS(unittest.TestCase):
             "norsul-12924593": {"area": "FORA_TI"},
             "adimax-6299518": {"area": "FORA_TI"},
             "agerio-2026-1-4": {
-                "area": "TI", "geografia": "INDETERMINADA",
+                "area": "TI", "geografia": "INDETERMINADA", "modalidade": "INDETERMINADA",
                 "situacao": "ENCERRADA", "prazo_inscricao": "2026-03-18",
+            },
+            "bcb-pepp-2026-2-rj": {
+                "tipo": "POS_GRADUACAO", "geografia": "RJ", "modalidade": "CONDICIONAL",
+                "situacao": "ENCERRADA", "prazo_inscricao": "2026-11-13",
             },
             "gaudium-12884181": {"modalidade": "REMOTA", "geografia": "INDETERMINADA"},
             "ccee-12665402": {"modalidade": "CONFLITO", "geografia": "INDETERMINADA"},
@@ -123,6 +147,11 @@ class AuditoriaProgramasATS(unittest.TestCase):
         for id_vaga, campos in casos.items():
             with self.subTest(id=id_vaga):
                 self.assertEqual({campo: self.por_id[id_vaga][campo] for campo in campos}, campos)
+
+        # A listagem externa associa ao mesmo ID um endereço e uma cidade em conflito.
+        evidencia_bcb = self.por_id["bcb-pepp-2026-2-rj"]["evidencia"]
+        for fato in ("326670", "Av. Paulista", "Brasília"):
+            self.assertIn(fato, evidencia_bcb)
 
     def test_rotas_apontam_para_publicacoes_da_vaga_ou_edicao(self):
         fontes_por_id = {
@@ -143,6 +172,35 @@ class AuditoriaProgramasATS(unittest.TestCase):
                 self.assertEqual(
                     ids_com_as_fontes, {id_vaga}, "publicação atribuída a mais de um ID"
                 )
+
+    def test_vagas_com_preserva_ids_e_datas_da_evidencia_complementar(self):
+        revalidacao = re.search(
+            r"^### Vagas\.com[^\n]*28/11/2026[^\n]*\n\n([^\n]+)",
+            self.relatorio,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(revalidacao, "faltou registrar a data da revalidação")
+        self.assertIn("Famílias do legado", revalidacao.group(1))
+        self.assertIn("INDETERMINADA", revalidacao.group(1))
+
+        # A listagem datada liga cada data ao detalhe público pelo ID.
+        casos = (
+            ("2843164", "13/11/2026", "analista-desenvolvimento-sistemas-jr-full-stack"),
+            ("2834898", "30/10/2026", "estagiario"),
+        )
+        urls_contadas = {
+            identidade_da_url(linha[campo])
+            for linha in self.publicas for campo in ROTAS.values() if linha[campo]
+        }
+        for id_vaga, publicacao, pagina in casos:
+            with self.subTest(id=id_vaga):
+                url = f"https://www.vagas.com.br/vagas/v{id_vaga}/{pagina}"
+                notas = re.findall(rf"^- [^\n]*\b{id_vaga}\b[^\n]*", self.relatorio, re.MULTILINE)
+                self.assertEqual(len(notas), 1, "o ID deve identificar um caso complementar")
+                self.assertIn(publicacao, notas[0])
+                links = re.findall(r"\]\((https://[^)]+)\)", notas[0])
+                self.assertIn(url, {identidade_da_url(link) for link in links})
+                self.assertNotIn(url, urls_contadas, "caso complementar entrou nas incidências")
 
     def test_verao_preserva_edicoes_controles_e_prazo_divergente(self):
         self.assertEqual(
@@ -205,11 +263,9 @@ class AuditoriaProgramasATS(unittest.TestCase):
                 anteriores.update(ids)
             self.assertEqual(anteriores, {linha["id"] for linha in recorte})
 
-        # A edição Icatu aparece duas vezes nas rotas e a Quantum tem dois
-        # links para a mesma oportunidade. A Blip amplia o recorte vigente.
+        # A edição Icatu aparece em duas rotas. A Blip amplia o recorte vigente.
         rotas_de_casos = {
             "icatu-2027-1": {"fonte_legado", "fonte_empregador"},
-            "quantum-estagio-produtos": {"fonte_empregador", "fonte_institucional"},
             "blip-tech-ai-2027": {"fonte_empregador"},
         }
         for id_vaga, fontes in rotas_de_casos.items():
